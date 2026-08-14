@@ -68,15 +68,15 @@ Create the smallest usable interactive shell around the harness.
 
 ## Features
 
-- [ ] Conversation viewport
-- [ ] Prompt input box
-- [ ] Submit user messages
-- [ ] Scroll conversation history
-- [ ] Display assistant text
-- [ ] Display current model
-- [ ] Display basic runtime status
-- [ ] Handle terminal resize
-- [ ] Keep rendering independent from model execution
+- [x] Conversation viewport
+- [x] Prompt input box
+- [x] Submit user messages
+- [x] Scroll conversation history
+- [x] Display assistant text
+- [x] Display current model
+- [x] Display basic runtime status
+- [x] Handle terminal resize
+- [x] Keep rendering independent from model execution
 
 ## Target Layout
 
