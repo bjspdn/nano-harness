@@ -7,6 +7,13 @@
 /// [`latest`]: https://github.com/ratatui/ratatui/tree/latest
 use std::time::Duration;
 
+mod provider;
+mod prompt;
+mod runtime;
+mod session;
+mod tools;
+mod tui;
+
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use crossterm::event::{self, KeyCode, KeyModifiers};
@@ -45,24 +52,17 @@ fn render(frame: &mut Frame) {
     frame.render_widget(greeting, frame.area());
 }
 
-/// Check if the user has pressed 'q'. This is where you would handle events. This example just
-/// checks if the user has pressed 'q' and returns true if they have. It does not handle any other
-/// events. There is a 250ms timeout on the event poll to ensure that the terminal is rendered at
-/// least once every 250ms. This allows you to do other work in the application loop, such as
-/// updating the application state, without blocking the event loop for too long.
+/// Check if the user has pressed 'q' or Ctrl-C. One event is consumed per call. There is a 250ms
+/// timeout on the event poll to ensure that the terminal is rendered at least once every 250ms.
+/// This allows you to do other work in the application loop, such as updating the application
+/// state, without blocking the event loop for too long.
 fn should_quit() -> Result<bool> {
     if event::poll(Duration::from_millis(250)).context("event poll failed")? {
-        let q_pressed = event::read()
-            .context("event read failed")?
-            .as_key_press_event()
-            .is_some_and(|key| key.code == KeyCode::Char('q'));
-
-        let ctrl_c_pressed = event::read()
-            .context("event read failed")?
-            .as_key_press_event()
-            .is_some_and(|key| {
-                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
-            });
+        let key = event::read().context("event read failed")?.as_key_press_event();
+        let q_pressed = key.is_some_and(|key| key.code == KeyCode::Char('q'));
+        let ctrl_c_pressed = key.is_some_and(|key| {
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+        });
         return Ok(q_pressed || ctrl_c_pressed);
     }
     Ok(false)

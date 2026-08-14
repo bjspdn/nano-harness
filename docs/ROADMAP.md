@@ -30,16 +30,16 @@ Establish the smallest useful Rust application structure without committing to u
 
 ## Features
 
-- [ ] Create Rust workspace / crate
-- [ ] Add `tokio`
-- [ ] Add `ratatui`
-- [ ] Add `crossterm`
-- [ ] Add `serde` / `serde_json`
-- [ ] Add `thiserror` or `anyhow`
-- [ ] Add `tracing`
-- [ ] Add basic CLI startup
-- [ ] Enter and restore terminal mode cleanly
-- [ ] Handle Ctrl-C and terminal shutdown correctly
+- [x] Create Rust workspace / crate
+- [x] Add `tokio`
+- [x] Add `ratatui`
+- [x] Add `crossterm`
+- [x] Add `serde` / `serde_json`
+- [x] Add `thiserror` or `anyhow`
+- [x] Add `tracing`
+- [x] Add basic CLI startup
+- [x] Enter and restore terminal mode cleanly
+- [x] Handle Ctrl-C and terminal shutdown correctly
 
 ## Initial Module Layout
 
