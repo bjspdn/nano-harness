@@ -7,11 +7,15 @@ edition = "2024"
 async-trait = "0.1.92"
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
+eventsource-stream = "=0.2.3"
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
 ratatui = "0.30.2"
-serde = "1.0.229"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+textwrap = { version = "0.16", default-features = false, features = ["unicode-linebreak", "unicode-width"] }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 tracing = "0.1.44"
 
 [dev-dependencies]

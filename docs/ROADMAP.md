@@ -177,7 +177,7 @@ A fake provider can stream text through the runtime into the TUI.
 
 ---
 
-# Phase 3 — OpenAI API Provider
+# Phase 3 — OpenRouter API Provider
 
 ## Objective
 
@@ -185,20 +185,47 @@ Implement one provider end to end before generalizing further.
 
 ## Features
 
-- [ ] API authentication
-- [ ] model selection
-- [ ] request serialization
-- [ ] streaming responses
-- [ ] tool definitions
-- [ ] tool-call parsing
-- [ ] usage parsing
-- [ ] cached-input-token parsing
-- [ ] context-window metadata
-- [ ] provider error mapping
+- [x] OpenRouter API-key authentication
+- [x] model catalog and model selection
+- [x] request serialization
+- [x] streaming responses
+- [x] usage parsing, including cached-input tokens
+- [x] context-window and model metadata
+- [x] provider error mapping
+
+## Current Provider Slice
+
+The pinned default model is `deepseek/deepseek-v4-flash-0731`. nano uses its
+bundled metadata immediately while a background, unauthenticated OpenRouter
+`/models` catalog request runs. A catalog failure leaves the default usable.
+
+Each generation sends one user message as an independent request. A later
+turn does not include earlier messages. This slice does not implement tools,
+multi-turn history, cache controls, session IDs, or automatic retries.
+
+While nano is not responding, `Ctrl-P` opens the model picker. It searches
+model names and IDs, shows context and input/output `$` per million prices,
+and places the current model first. `Enter` submits a selection and the modal
+stays open until the runtime acknowledges it; `Esc` closes the modal. Selection
+or request failures remain visible and do not silently fall back to another
+model.
+
+The status line reports raw `in`, `cache`, and `out` token counts. An output
+length limit is visible as a truncated response. The provider uses a
+10-second connect timeout and does not retry requests automatically.
+
+See the [OpenRouter operator guide](OPENROUTER.md) for credential setup and a
+manual smoke procedure.
+
+## Deferred Command Menu Direction
+
+When a future prompt draft begins with `/`, suggestions should include
+`/models` and reuse this picker modal. Command parsing and the `CommandMenu`
+are not implemented; `Ctrl-P` is the current model-picker entry point.
 
 ## Exit Criteria
 
-nano can hold a real streaming conversation through the OpenAI API and display usage data in the TUI.
+nano can hold a real streaming conversation through the OpenRouter API and display usage data in the TUI.
 
 ---
 
@@ -518,29 +545,32 @@ The user can understand the current run without reading logs.
 
 ---
 
-# Phase 11 — OpenRouter Provider
+# Phase 11 — OpenAI API Provider
 
 ## Objective
 
-Add OpenRouter without changing the core runtime model.
+Add OpenAI as the second initial provider, after OpenRouter, without changing
+the core runtime model.
 
 ## Features
 
-- [ ] OpenRouter authentication
+- [ ] OpenAI authentication
 - [ ] model selection
+- [ ] request mapping
 - [ ] streaming
-- [ ] tools
 - [ ] usage
-- [ ] cache-read / cache-write information where exposed
-- [ ] context-window metadata
+- [ ] model limits
 
 ## Constraint
 
-If OpenRouter exposes provider-specific behavior, keep it inside the adapter unless at least one other provider needs the same abstraction.
+Keep OpenAI-specific authentication, request mapping, and response behavior
+inside the adapter unless at least one other provider needs the same
+abstraction.
 
 ## Exit Criteria
 
-Switching between OpenAI and OpenRouter does not require changes to session, prompt, tool, or TUI code.
+OpenAI can be added after OpenRouter without changes to the provider-neutral
+runtime, prompt, tool, or TUI boundaries.
 
 ---
 
@@ -548,7 +578,7 @@ Switching between OpenAI and OpenRouter does not require changes to session, pro
 
 ## Objective
 
-Add OpenCode Go as the third initial provider.
+Add OpenCode Go as the third initial provider, after OpenRouter and OpenAI.
 
 ## Features
 
@@ -562,7 +592,8 @@ Add OpenCode Go as the third initial provider.
 
 ## Exit Criteria
 
-nano supports OpenAI, OpenRouter, and OpenCode Go through the same minimal runtime abstraction.
+nano supports OpenRouter, OpenAI, and OpenCode Go through the same minimal
+runtime abstraction.
 
 ---
 
@@ -576,21 +607,32 @@ Add only the configuration users actually need.
 
 - [ ] provider
 - [ ] model
-- [ ] API credentials through environment variables
+- [x] OpenRouter API credentials through `OPENROUTER_API_KEY` or the optional
+  read-only auth file described in [the operator guide](OPENROUTER.md)
 - [ ] reserved output-token budget
 - [ ] project instruction file behavior
 
-Possible format:
+Possible future format:
 
 ```toml
-provider = "openai"
-model = "..."
+provider = "openrouter"
+model = "deepseek/deepseek-v4-flash-0731"
 reserved_output_tokens = 8192
 ```
 
 Avoid a large configuration schema.
 
-Environment variables should remain sufficient for secrets.
+Environment variables should remain sufficient for secrets. The implemented
+OpenRouter auth file is an optional read-only fallback, not a required
+configuration layer.
+
+## Deferred Model Onboarding
+
+A later onboarding/configuration phase should remove the automatic default
+model. nano should start without an active model until the user has added a
+provider credential and explicitly selected a model. The pinned OpenRouter
+default remains the current Phase 3 bootstrap behavior; this deferred decision
+does not change startup in this phase.
 
 ## Exit Criteria
 
@@ -731,19 +773,19 @@ They should not influence the initial architecture.
 
 nano reaches its first meaningful MVP when it can:
 
-- [ ] launch a Ratatui interface
-- [ ] accept a user prompt
-- [ ] stream a response from one real provider
-- [ ] maintain session history
+- [x] launch a Ratatui interface
+- [x] accept a user prompt
+- [x] stream a response from one real provider
+- [ ] maintain model-visible session history
 - [ ] compose a deterministic system prompt
 - [ ] execute basic coding tools
 - [ ] continue the model loop after tool calls
-- [ ] report token usage
+- [x] report raw token usage
 - [ ] report cache-hit ratio
 - [ ] report remaining context percentage
 - [ ] preserve a cache-friendly prompt prefix
 - [ ] cancel a running request
-- [ ] exit cleanly
+- [x] exit cleanly
 
 At that point, nano is already a useful agent harness.
 
@@ -757,7 +799,7 @@ Everything after that should be justified by actual usage.
 1. project skeleton
 2. minimal Ratatui UI
 3. provider interface
-4. OpenAI provider
+4. OpenRouter provider
 5. session model
 6. prompt stack
 7. cache accounting
@@ -765,8 +807,8 @@ Everything after that should be justified by actual usage.
 9. tool runtime
 10. agent loop
 11. tool activity UI
-12. OpenRouter
-13. OpenCode Go
+12. OpenAI provider
+13. OpenCode Go provider
 14. configuration
 15. persistence
 16. context compaction
@@ -785,7 +827,7 @@ Ratatui
  ↓
 nano runtime
  ↓
-OpenAI
+OpenRouter
  ↓
 streamed response
 ```

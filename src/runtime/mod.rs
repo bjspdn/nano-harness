@@ -5,7 +5,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::provider::{ModelEvent, ModelRequest, Provider};
+use crate::provider::{
+    CompletionOutcome, ModelEvent, ModelMetadata, ModelRequest, Provider, ProviderError, Usage,
+};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 4;
 const EVENT_CHANNEL_CAPACITY: usize = 8;
@@ -13,16 +15,43 @@ const EVENT_CHANNEL_CAPACITY: usize = 8;
 /// The commands accepted by the harness runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommand {
+    DiscoverModels,
+    SelectModel(String),
     Submit(String),
 }
 
 /// Events emitted by the harness runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessEvent {
+    CatalogLoading,
+    CatalogLoaded(Vec<ModelMetadata>),
+    CatalogFailed(String),
+    ModelSelected(ModelMetadata),
+    ModelSelectionFailed(String),
     ResponseStarted,
     AssistantDelta(String),
-    ResponseFinished,
+    Usage(Usage),
+    ResponseFinished(CompletionOutcome),
     Error(String),
+}
+
+#[derive(Debug)]
+enum CatalogState {
+    Loading,
+    Loaded(Vec<ModelMetadata>),
+    Failed,
+}
+
+struct CatalogTask {
+    handle: Option<JoinHandle<Result<Vec<ModelMetadata>, ProviderError>>>,
+}
+
+impl Drop for CatalogTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
 }
 
 /// Start the provider-backed harness runtime.
@@ -40,31 +69,222 @@ pub fn spawn_runtime(
     let (event_sender, event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
     let task_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                command = command_receiver.recv() => {
-                    let Some(RuntimeCommand::Submit(input)) = command else {
-                        break;
-                    };
+        if !send_harness_event(&event_sender, HarnessEvent::CatalogLoading).await {
+            return;
+        }
 
-                    if consume_provider_stream(
-                        provider.as_ref(),
-                        &model_id,
-                        input,
+        let mut catalog_state = CatalogState::Loading;
+        let mut catalog_task = Some(spawn_catalog_task(Arc::clone(&provider)));
+        let mut selected_model_id = model_id;
+
+        loop {
+            let loop_outcome = tokio::select! {
+                command = command_receiver.recv() => {
+                    match command {
+                        Some(command) => handle_runtime_command(
+                            command,
+                            &provider,
+                            &mut selected_model_id,
+                            &mut catalog_state,
+                            &mut catalog_task,
+                            &event_sender,
+                        )
+                        .await,
+                        None => StreamOutcome::Exit,
+                    }
+                }
+                catalog_result = await_catalog_task(&mut catalog_task), if catalog_task.is_some() => {
+                    let catalog_result = catalog_result
+                        .expect("catalog task should exist while its result is selected");
+                    handle_catalog_result(
+                        catalog_result,
+                        &mut selected_model_id,
+                        &mut catalog_state,
+                        &mut catalog_task,
                         &event_sender,
                     )
                     .await
-                        == StreamOutcome::Exit
-                    {
-                        break;
-                    }
                 }
-                _ = event_sender.closed() => break,
+                _ = event_sender.closed() => StreamOutcome::Exit,
+            };
+
+            if loop_outcome == StreamOutcome::Exit {
+                break;
             }
         }
+
+        stop_catalog_task(catalog_task).await;
     });
 
     (command_sender, event_receiver, task_handle)
+}
+
+fn spawn_catalog_task(provider: Arc<dyn Provider>) -> CatalogTask {
+    CatalogTask {
+        handle: Some(tokio::spawn(async move { provider.models().await })),
+    }
+}
+
+async fn await_catalog_task(
+    catalog_task: &mut Option<CatalogTask>,
+) -> Option<Result<Result<Vec<ModelMetadata>, ProviderError>, tokio::task::JoinError>> {
+    let catalog_task = catalog_task.as_mut()?;
+    Some(catalog_task.handle.as_mut()?.await)
+}
+
+async fn handle_runtime_command(
+    command: RuntimeCommand,
+    provider: &Arc<dyn Provider>,
+    selected_model_id: &mut String,
+    catalog_state: &mut CatalogState,
+    catalog_task: &mut Option<CatalogTask>,
+    event_sender: &mpsc::Sender<HarnessEvent>,
+) -> StreamOutcome {
+    match command {
+        RuntimeCommand::DiscoverModels => {
+            discover_models(provider, catalog_state, catalog_task, event_sender).await
+        }
+        RuntimeCommand::SelectModel(model_id) => {
+            select_model(model_id, selected_model_id, catalog_state, event_sender).await
+        }
+        RuntimeCommand::Submit(input) => {
+            consume_provider_stream(provider.as_ref(), selected_model_id, input, event_sender).await
+        }
+    }
+}
+
+async fn discover_models(
+    provider: &Arc<dyn Provider>,
+    catalog_state: &mut CatalogState,
+    catalog_task: &mut Option<CatalogTask>,
+    event_sender: &mpsc::Sender<HarnessEvent>,
+) -> StreamOutcome {
+    if !matches!(catalog_state, CatalogState::Failed) {
+        return StreamOutcome::Continue;
+    }
+
+    if !send_harness_event(event_sender, HarnessEvent::CatalogLoading).await {
+        return StreamOutcome::Exit;
+    }
+
+    *catalog_state = CatalogState::Loading;
+    *catalog_task = Some(spawn_catalog_task(Arc::clone(provider)));
+    StreamOutcome::Continue
+}
+
+async fn select_model(
+    model_id: String,
+    selected_model_id: &mut String,
+    catalog_state: &CatalogState,
+    event_sender: &mpsc::Sender<HarnessEvent>,
+) -> StreamOutcome {
+    let selection = if model_id.is_empty() {
+        Err("model ID cannot be empty".to_owned())
+    } else {
+        match catalog_state {
+            CatalogState::Loading => Err("model catalog is still loading".to_owned()),
+            CatalogState::Failed => Err(
+                "model catalog discovery failed; reopen Ctrl-P to retry model discovery".to_owned(),
+            ),
+            CatalogState::Loaded(models) => models
+                .iter()
+                .find(|metadata| metadata.model_id == model_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("model '{model_id}' is not available in the loaded catalog")
+                }),
+        }
+    };
+
+    let metadata = match selection {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if send_harness_event(event_sender, HarnessEvent::ModelSelectionFailed(error)).await {
+                return StreamOutcome::Continue;
+            }
+            return StreamOutcome::Exit;
+        }
+    };
+
+    *selected_model_id = metadata.model_id.clone();
+    if send_harness_event(event_sender, HarnessEvent::ModelSelected(metadata)).await {
+        StreamOutcome::Continue
+    } else {
+        StreamOutcome::Exit
+    }
+}
+
+async fn handle_catalog_result(
+    catalog_result: Result<Result<Vec<ModelMetadata>, ProviderError>, tokio::task::JoinError>,
+    selected_model_id: &mut String,
+    catalog_state: &mut CatalogState,
+    catalog_task: &mut Option<CatalogTask>,
+    event_sender: &mpsc::Sender<HarnessEvent>,
+) -> StreamOutcome {
+    *catalog_task = None;
+
+    let catalog_result = match catalog_result {
+        Ok(catalog_result) => catalog_result,
+        Err(error) => {
+            *catalog_state = CatalogState::Failed;
+            return report_catalog_failure(
+                event_sender,
+                format!("model catalog task failed: {error}"),
+            )
+            .await;
+        }
+    };
+
+    let models = match catalog_result {
+        Ok(models) => models,
+        Err(error) => {
+            *catalog_state = CatalogState::Failed;
+            return report_catalog_failure(event_sender, error.to_string()).await;
+        }
+    };
+
+    let selected_metadata = models
+        .iter()
+        .find(|metadata| metadata.model_id == *selected_model_id)
+        .cloned();
+    *catalog_state = CatalogState::Loaded(models.clone());
+
+    if !send_harness_event(event_sender, HarnessEvent::CatalogLoaded(models)).await {
+        return StreamOutcome::Exit;
+    }
+
+    let Some(selected_metadata) = selected_metadata else {
+        return StreamOutcome::Continue;
+    };
+
+    if send_harness_event(event_sender, HarnessEvent::ModelSelected(selected_metadata)).await {
+        StreamOutcome::Continue
+    } else {
+        StreamOutcome::Exit
+    }
+}
+
+async fn report_catalog_failure(
+    event_sender: &mpsc::Sender<HarnessEvent>,
+    error: String,
+) -> StreamOutcome {
+    if send_harness_event(event_sender, HarnessEvent::CatalogFailed(error)).await {
+        StreamOutcome::Continue
+    } else {
+        StreamOutcome::Exit
+    }
+}
+
+async fn stop_catalog_task(catalog_task: Option<CatalogTask>) {
+    let Some(mut catalog_task) = catalog_task else {
+        return;
+    };
+
+    let Some(handle) = catalog_task.handle.take() else {
+        return;
+    };
+    handle.abort();
+    let _ = handle.await;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +323,11 @@ async fn consume_provider_stream(
         };
 
         let Some(model_event) = model_event else {
-            return report_error(event_sender, "provider stream ended before Done".to_owned())
-                .await;
+            return report_error(
+                event_sender,
+                "provider stream ended before a terminal event".to_owned(),
+            )
+            .await;
         };
 
         match model_event {
@@ -125,15 +348,23 @@ async fn consume_provider_stream(
                     return StreamOutcome::Exit;
                 }
             }
-            Ok(ModelEvent::Done) => {
-                if !send_harness_event(event_sender, HarnessEvent::ResponseFinished).await {
+            Ok(ModelEvent::Finished(completion_outcome)) => {
+                if !send_harness_event(
+                    event_sender,
+                    HarnessEvent::ResponseFinished(completion_outcome),
+                )
+                .await
+                {
                     return StreamOutcome::Exit;
                 }
                 return StreamOutcome::Continue;
             }
-            Ok(ModelEvent::ReasoningDelta(_))
-            | Ok(ModelEvent::ToolCall(_))
-            | Ok(ModelEvent::Usage(_)) => {}
+            Ok(ModelEvent::Usage(usage)) => {
+                if !send_harness_event(event_sender, HarnessEvent::Usage(usage)).await {
+                    return StreamOutcome::Exit;
+                }
+            }
+            Ok(ModelEvent::ReasoningDelta(_)) | Ok(ModelEvent::ToolCall(_)) => {}
             Err(error) => return report_error(event_sender, error.to_string()).await,
         }
     }
@@ -158,23 +389,87 @@ async fn send_harness_event(
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use tokio::sync::{mpsc, oneshot};
 
     use super::{HarnessEvent, RuntimeCommand};
     use crate::provider::{
-        ModelEvent, ModelLimits, ModelMetadata, ModelRequest, ModelStream, Provider, ProviderError,
-        ToolCall, Usage,
+        CompletionOutcome, ModelEvent, ModelLimits, ModelMetadata, ModelRequest, ModelStream,
+        Provider, ProviderError, ToolCall, Usage,
     };
 
     const TEST_MODEL_ID: &str = "test-model";
+
+    fn test_model_metadata(model_id: &str) -> ModelMetadata {
+        ModelMetadata {
+            model_id: model_id.to_owned(),
+            display_name: model_id.to_owned(),
+            limits: ModelLimits {
+                context_window_tokens: 1,
+                maximum_output_tokens: Some(1),
+            },
+            prompt_price_usd_per_million_tokens: None,
+            completion_price_usd_per_million_tokens: None,
+        }
+    }
+
+    async fn settle_default_catalog(event_receiver: &mut mpsc::Receiver<HarnessEvent>) {
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(vec![test_model_metadata(
+                TEST_MODEL_ID,
+            )]))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(test_model_metadata(
+                TEST_MODEL_ID
+            )))
+        );
+    }
+
+    async fn wait_for_catalog_request(provider: &ScriptedProvider) {
+        for _ in 0..64 {
+            if provider.catalog_request_count() > 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the catalog request should have started");
+    }
 
     #[tokio::test(start_paused = true)]
     async fn streams_the_fake_response_without_changing_its_visible_text() {
         let provider: Arc<dyn Provider> = Arc::new(crate::provider::FakeProvider::new());
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider, crate::provider::MOCK_MODEL_NAME.to_owned());
+
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        let fake_model_metadata = crate::provider::FakeProvider::new()
+            .models()
+            .await
+            .expect("fake catalog should succeed")
+            .pop()
+            .expect("fake catalog should contain one model");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(vec![
+                fake_model_metadata.clone()
+            ]))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(fake_model_metadata))
+        );
 
         command_sender
             .send(RuntimeCommand::Submit("fake input".to_owned()))
@@ -210,7 +505,15 @@ mod tests {
         );
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::Usage(Usage {
+                input_tokens: 24,
+                cached_input_tokens: 8,
+                output_tokens: 16,
+            }))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
 
         drop(command_sender);
@@ -220,11 +523,12 @@ mod tests {
     #[tokio::test]
     async fn forwards_exact_requests_and_keeps_turns_serial() {
         let provider = Arc::new(ScriptedProvider::new(vec![
-            StreamScript::Events(vec![Ok(ModelEvent::Done)]),
-            StreamScript::Events(vec![Ok(ModelEvent::Done)]),
+            StreamScript::Events(vec![Ok(ModelEvent::Finished(CompletionOutcome::Complete))]),
+            StreamScript::Events(vec![Ok(ModelEvent::Finished(CompletionOutcome::Complete))]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit(" first\nsubmission ".to_owned()))
@@ -232,7 +536,7 @@ mod tests {
             .expect("runtime should accept the first submission");
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
         assert_eq!(
             provider.requests(),
@@ -248,7 +552,7 @@ mod tests {
             .expect("runtime should accept the second submission");
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
         assert_eq!(
             provider.requests(),
@@ -263,6 +567,322 @@ mod tests {
                 },
             ]
         );
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn startup_discovery_emits_loading_catalog_and_live_selected_metadata() {
+        let models = vec![
+            ModelMetadata {
+                model_id: TEST_MODEL_ID.to_owned(),
+                display_name: "Live test model".to_owned(),
+                limits: ModelLimits {
+                    context_window_tokens: 16_384,
+                    maximum_output_tokens: Some(2_048),
+                },
+                prompt_price_usd_per_million_tokens: Some("0.10".to_owned()),
+                completion_price_usd_per_million_tokens: Some("0.40".to_owned()),
+            },
+            test_model_metadata("second-model"),
+        ];
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::Result(Ok(models.clone()))],
+            Vec::new(),
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(models.clone()))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(models[0].clone()))
+        );
+        assert_eq!(provider.catalog_request_count(), 1);
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_retries_only_after_discover_command() {
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![
+                CatalogScript::Result(Err(ProviderError::RequestSetup(
+                    "catalog unavailable".to_owned(),
+                ))),
+                CatalogScript::Result(Ok(vec![test_model_metadata(TEST_MODEL_ID)])),
+            ],
+            Vec::new(),
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogFailed(
+                "request setup failed: catalog unavailable".to_owned()
+            ))
+        );
+
+        command_sender
+            .send(RuntimeCommand::SelectModel(TEST_MODEL_ID.to_owned()))
+            .await
+            .expect("runtime should accept a model selection command");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelectionFailed(
+                "model catalog discovery failed; reopen Ctrl-P to retry model discovery".to_owned()
+            ))
+        );
+
+        command_sender
+            .send(RuntimeCommand::DiscoverModels)
+            .await
+            .expect("runtime should accept a discovery retry command");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(vec![test_model_metadata(
+                TEST_MODEL_ID,
+            )]))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(test_model_metadata(
+                TEST_MODEL_ID
+            )))
+        );
+
+        command_sender
+            .send(RuntimeCommand::DiscoverModels)
+            .await
+            .expect("runtime should accept a duplicate discovery command");
+        command_sender
+            .send(RuntimeCommand::SelectModel("missing-model".to_owned()))
+            .await
+            .expect("runtime should accept a stale selection command");
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelectionFailed(message))
+                if message.contains("not available in the loaded catalog")
+        ));
+        assert!(event_receiver.try_recv().is_err());
+        assert_eq!(provider.catalog_request_count(), 2);
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn valid_selection_changes_the_next_exact_provider_request() {
+        let alternate_model = test_model_metadata("alternate-model");
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::Result(Ok(vec![alternate_model.clone()]))],
+            vec![StreamScript::Events(vec![Ok(ModelEvent::Finished(
+                CompletionOutcome::Complete,
+            ))])],
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(vec![alternate_model.clone()]))
+        );
+        assert!(event_receiver.try_recv().is_err());
+
+        command_sender
+            .send(RuntimeCommand::SelectModel(
+                alternate_model.model_id.clone(),
+            ))
+            .await
+            .expect("runtime should accept a valid model selection");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(alternate_model.clone()))
+        );
+
+        command_sender
+            .send(RuntimeCommand::Submit("selected model input".to_owned()))
+            .await
+            .expect("runtime should accept a submission");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
+        );
+        assert_eq!(
+            provider.requests(),
+            vec![ModelRequest {
+                model_id: alternate_model.model_id,
+                input: "selected model input".to_owned(),
+            }]
+        );
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_and_empty_selection_preserve_the_active_model() {
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::Result(Ok(vec![
+                test_model_metadata(TEST_MODEL_ID),
+                test_model_metadata("other-model"),
+            ]))],
+            vec![StreamScript::Events(vec![Ok(ModelEvent::Finished(
+                CompletionOutcome::Complete,
+            ))])],
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+        let expected_models = vec![
+            test_model_metadata(TEST_MODEL_ID),
+            test_model_metadata("other-model"),
+        ];
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(expected_models))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(test_model_metadata(
+                TEST_MODEL_ID
+            )))
+        );
+
+        for model_id in ["stale-model", ""] {
+            command_sender
+                .send(RuntimeCommand::SelectModel(model_id.to_owned()))
+                .await
+                .expect("runtime should accept a selection command");
+            assert!(matches!(
+                event_receiver.recv().await,
+                Some(HarnessEvent::ModelSelectionFailed(_))
+            ));
+        }
+
+        command_sender
+            .send(RuntimeCommand::Submit("preserve active model".to_owned()))
+            .await
+            .expect("runtime should accept a submission");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
+        );
+        assert_eq!(provider.requests()[0].model_id, TEST_MODEL_ID);
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn selection_while_loading_preserves_the_initial_model() {
+        let (catalog_completion_sender, catalog_completion_receiver) = oneshot::channel();
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::WaitForCancellation {
+                completion_sender: catalog_completion_sender,
+            }],
+            vec![StreamScript::Events(vec![Ok(ModelEvent::Finished(
+                CompletionOutcome::Complete,
+            ))])],
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        wait_for_catalog_request(&provider).await;
+        command_sender
+            .send(RuntimeCommand::DiscoverModels)
+            .await
+            .expect("runtime should accept a loading-state discovery command");
+        command_sender
+            .send(RuntimeCommand::SelectModel("other-model".to_owned()))
+            .await
+            .expect("runtime should accept a loading-state selection");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelectionFailed(
+                "model catalog is still loading".to_owned()
+            ))
+        );
+        assert_eq!(provider.catalog_request_count(), 1);
+
+        command_sender
+            .send(RuntimeCommand::Submit("loading catalog input".to_owned()))
+            .await
+            .expect("runtime should accept a submission while discovery is pending");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
+        );
+        assert_eq!(provider.requests()[0].model_id, TEST_MODEL_ID);
+
+        drop(event_receiver);
+        tokio::time::timeout(Duration::from_secs(1), catalog_completion_receiver)
+            .await
+            .expect("catalog request should stop after output closure")
+            .expect("catalog provider should observe cancellation");
+        assert!(task_handle.await.is_ok());
+        drop(command_sender);
+    }
+
+    #[tokio::test]
+    async fn forwards_usage_before_a_length_limited_completion() {
+        let usage = Usage {
+            input_tokens: 42,
+            cached_input_tokens: 17,
+            output_tokens: 99,
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![StreamScript::Events(vec![
+            Ok(ModelEvent::Usage(usage)),
+            Ok(ModelEvent::Finished(CompletionOutcome::LengthLimited)),
+        ])]));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
+
+        command_sender
+            .send(RuntimeCommand::Submit("limited input".to_owned()))
+            .await
+            .expect("runtime should accept a submission");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::Usage(usage))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ResponseFinished(
+                CompletionOutcome::LengthLimited
+            ))
+        );
+        assert!(event_receiver.try_recv().is_err());
 
         drop(command_sender);
         assert!(task_handle.await.is_ok());
@@ -285,16 +905,25 @@ mod tests {
             })),
             Ok(ModelEvent::TextDelta("visible".to_owned())),
             Ok(ModelEvent::TextDelta(String::new())),
-            Ok(ModelEvent::Done),
+            Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
         ])]));
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("input".to_owned()))
             .await
             .expect("runtime should accept the submission");
 
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::Usage(Usage {
+                input_tokens: 4,
+                cached_input_tokens: 2,
+                output_tokens: 3,
+            }))
+        );
         assert_eq!(
             event_receiver.recv().await,
             Some(HarnessEvent::ResponseStarted)
@@ -305,7 +934,7 @@ mod tests {
         );
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
         assert!(event_receiver.try_recv().is_err());
 
@@ -328,10 +957,11 @@ mod tests {
                 cached_input_tokens: 2,
                 output_tokens: 3,
             })),
-            Ok(ModelEvent::Done),
+            Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
         ])]));
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("input".to_owned()))
@@ -340,7 +970,15 @@ mod tests {
 
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::Usage(Usage {
+                input_tokens: 4,
+                cached_input_tokens: 2,
+                output_tokens: 3,
+            }))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
         assert!(event_receiver.try_recv().is_err());
 
@@ -354,11 +992,12 @@ mod tests {
             StreamScript::SetupError(ProviderError::RequestSetup("invalid request".to_owned())),
             StreamScript::Events(vec![
                 Ok(ModelEvent::TextDelta("recovered".to_owned())),
-                Ok(ModelEvent::Done),
+                Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
             ]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("first".to_owned()))
@@ -386,7 +1025,7 @@ mod tests {
         );
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
 
         drop(command_sender);
@@ -401,17 +1040,18 @@ mod tests {
                 events: vec![
                     Ok(ModelEvent::TextDelta("partial".to_owned())),
                     Err(ProviderError::Streaming("connection lost".to_owned())),
-                    Ok(ModelEvent::Done),
+                    Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
                 ],
                 completion_sender,
             },
             StreamScript::Events(vec![
                 Ok(ModelEvent::TextDelta("recovered".to_owned())),
-                Ok(ModelEvent::Done),
+                Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
             ]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("first".to_owned()))
@@ -451,7 +1091,7 @@ mod tests {
         );
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
 
         drop(command_sender);
@@ -464,11 +1104,12 @@ mod tests {
             StreamScript::Events(vec![Ok(ModelEvent::TextDelta("partial".to_owned()))]),
             StreamScript::Events(vec![
                 Ok(ModelEvent::TextDelta("recovered".to_owned())),
-                Ok(ModelEvent::Done),
+                Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
             ]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("first".to_owned()))
@@ -485,7 +1126,7 @@ mod tests {
         assert_eq!(
             event_receiver.recv().await,
             Some(HarnessEvent::Error(
-                "provider stream ended before Done".to_owned()
+                "provider stream ended before a terminal event".to_owned()
             ))
         );
         assert!(event_receiver.try_recv().is_err());
@@ -504,7 +1145,7 @@ mod tests {
         );
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
 
         drop(command_sender);
@@ -517,7 +1158,7 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(vec![
             StreamScript::WaitForReceiverDrop {
                 events: vec![
-                    Ok(ModelEvent::Done),
+                    Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
                     Ok(ModelEvent::TextDelta("late text".to_owned())),
                     Err(ProviderError::Streaming("late error".to_owned())),
                 ],
@@ -526,6 +1167,7 @@ mod tests {
         ]));
         let (command_sender, mut event_receiver, task_handle) =
             super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("input".to_owned()))
@@ -533,7 +1175,7 @@ mod tests {
             .expect("runtime should accept the submission");
         assert_eq!(
             event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished)
+            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
         );
         assert!(event_receiver.try_recv().is_err());
         tokio::time::timeout(std::time::Duration::from_secs(1), completion_receiver)
@@ -546,16 +1188,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_harness_output_drops_active_provider_work() {
-        let (completion_sender, completion_receiver) = oneshot::channel();
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            StreamScript::WaitForReceiverDrop {
+    async fn closed_harness_output_drops_active_generation_and_catalog_work() {
+        let (catalog_completion_sender, catalog_completion_receiver) = oneshot::channel();
+        let (stream_completion_sender, stream_completion_receiver) = oneshot::channel();
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::WaitForCancellation {
+                completion_sender: catalog_completion_sender,
+            }],
+            vec![StreamScript::WaitForReceiverDrop {
                 events: vec![Ok(ModelEvent::TextDelta("partial".to_owned()))],
-                completion_sender,
-            },
-        ]));
+                completion_sender: stream_completion_sender,
+            }],
+        ));
         let (command_sender, mut event_receiver, task_handle) =
-            super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        wait_for_catalog_request(&provider).await;
 
         command_sender
             .send(RuntimeCommand::Submit("input".to_owned()))
@@ -571,12 +1222,44 @@ mod tests {
         );
 
         drop(event_receiver);
-        tokio::time::timeout(std::time::Duration::from_secs(1), completion_receiver)
+        tokio::time::timeout(Duration::from_secs(1), stream_completion_receiver)
             .await
             .expect("provider receiver should be dropped after output closure")
             .expect("provider should report receiver closure");
+        tokio::time::timeout(Duration::from_secs(1), catalog_completion_receiver)
+            .await
+            .expect("catalog request should be dropped after output closure")
+            .expect("catalog provider should report cancellation");
         assert!(task_handle.await.is_ok());
         drop(command_sender);
+    }
+
+    #[tokio::test]
+    async fn aborting_runtime_drops_an_active_catalog_request() {
+        let (catalog_completion_sender, catalog_completion_receiver) = oneshot::channel();
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::WaitForCancellation {
+                completion_sender: catalog_completion_sender,
+            }],
+            Vec::new(),
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        wait_for_catalog_request(&provider).await;
+
+        task_handle.abort();
+        assert!(task_handle.await.is_err());
+        tokio::time::timeout(Duration::from_secs(1), catalog_completion_receiver)
+            .await
+            .expect("catalog request should stop with the runtime task")
+            .expect("catalog provider should observe runtime cancellation");
+        drop(command_sender);
+        drop(event_receiver);
     }
 
     #[tokio::test]
@@ -592,13 +1275,29 @@ mod tests {
     #[derive(Debug)]
     struct ScriptedProvider {
         requests: Arc<Mutex<Vec<ModelRequest>>>,
+        catalog_requests: Arc<Mutex<usize>>,
+        catalog_scripts: Mutex<VecDeque<CatalogScript>>,
         scripts: Mutex<VecDeque<StreamScript>>,
     }
 
     impl ScriptedProvider {
         fn new(scripts: Vec<StreamScript>) -> Self {
+            Self::with_catalog_scripts(
+                vec![CatalogScript::Result(Ok(vec![test_model_metadata(
+                    TEST_MODEL_ID,
+                )]))],
+                scripts,
+            )
+        }
+
+        fn with_catalog_scripts(
+            catalog_scripts: Vec<CatalogScript>,
+            scripts: Vec<StreamScript>,
+        ) -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
+                catalog_requests: Arc::new(Mutex::new(0)),
+                catalog_scripts: Mutex::new(catalog_scripts.into()),
                 scripts: Mutex::new(scripts.into()),
             }
         }
@@ -609,6 +1308,21 @@ mod tests {
                 .expect("request recording lock should not be poisoned")
                 .clone()
         }
+
+        fn catalog_request_count(&self) -> usize {
+            *self
+                .catalog_requests
+                .lock()
+                .expect("catalog request lock should not be poisoned")
+        }
+    }
+
+    #[derive(Debug)]
+    enum CatalogScript {
+        Result(Result<Vec<ModelMetadata>, ProviderError>),
+        WaitForCancellation {
+            completion_sender: oneshot::Sender<()>,
+        },
     }
 
     #[derive(Debug)]
@@ -624,14 +1338,28 @@ mod tests {
     #[async_trait]
     impl Provider for ScriptedProvider {
         fn model_metadata(&self, model_id: &str) -> Result<ModelMetadata, ProviderError> {
-            Ok(ModelMetadata {
-                model_id: model_id.to_owned(),
-                display_name: model_id.to_owned(),
-                limits: ModelLimits {
-                    context_window_tokens: 1,
-                    maximum_output_tokens: 1,
-                },
-            })
+            Ok(test_model_metadata(model_id))
+        }
+
+        async fn models(&self) -> Result<Vec<ModelMetadata>, ProviderError> {
+            *self
+                .catalog_requests
+                .lock()
+                .expect("catalog request lock should not be poisoned") += 1;
+            let catalog_script = self
+                .catalog_scripts
+                .lock()
+                .expect("catalog script lock should not be poisoned")
+                .pop_front()
+                .expect("the test provider should have a script for every catalog request");
+
+            match catalog_script {
+                CatalogScript::Result(result) => result,
+                CatalogScript::WaitForCancellation { completion_sender } => {
+                    let _completion_guard = NotifyOnDrop(Some(completion_sender));
+                    std::future::pending().await
+                }
+            }
         }
 
         async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProviderError> {
@@ -654,6 +1382,17 @@ mod tests {
                     events,
                     completion_sender,
                 } => Ok(stream_that_reports_receiver_drop(events, completion_sender)),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            if let Some(completion_sender) = self.0.take() {
+                let _ = completion_sender.send(());
             }
         }
     }

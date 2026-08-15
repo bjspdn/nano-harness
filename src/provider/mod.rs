@@ -5,9 +5,13 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+#[cfg(test)]
 mod fake;
+mod openrouter;
 
+#[cfg(test)]
 pub use fake::{FakeProvider, MOCK_MODEL_NAME};
+pub use openrouter::{OPENROUTER_DEFAULT_MODEL_ID, OpenRouterProvider};
 
 /// The input submitted to a provider for one model request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +24,7 @@ pub struct ModelRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelLimits {
     pub context_window_tokens: u64,
-    pub maximum_output_tokens: u64,
+    pub maximum_output_tokens: Option<u64>,
 }
 
 /// Local metadata describing a model.
@@ -29,6 +33,8 @@ pub struct ModelMetadata {
     pub model_id: String,
     pub display_name: String,
     pub limits: ModelLimits,
+    pub prompt_price_usd_per_million_tokens: Option<String>,
+    pub completion_price_usd_per_million_tokens: Option<String>,
 }
 
 /// A complete tool call normalized from a provider response.
@@ -47,6 +53,13 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// The normalized reason a provider stream finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionOutcome {
+    Complete,
+    LengthLimited,
+}
+
 /// Normalized events emitted by a provider stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelEvent {
@@ -56,7 +69,7 @@ pub enum ModelEvent {
     #[allow(dead_code)] // Required contract variant; production tool adapters are deferred.
     ToolCall(ToolCall),
     Usage(Usage),
-    Done,
+    Finished(CompletionOutcome),
 }
 
 /// The bounded receiver returned by a provider stream.
@@ -80,6 +93,8 @@ pub enum ProviderError {
 pub trait Provider: Send + Sync {
     fn model_metadata(&self, model_id: &str) -> Result<ModelMetadata, ProviderError>;
 
+    async fn models(&self) -> Result<Vec<ModelMetadata>, ProviderError>;
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProviderError>;
 }
 
@@ -90,8 +105,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        FakeProvider, MOCK_MODEL_NAME, ModelEvent, ModelLimits, ModelMetadata, Provider,
-        ProviderError, ToolCall, Usage,
+        CompletionOutcome, FakeProvider, MOCK_MODEL_NAME, ModelEvent, ModelLimits, ModelMetadata,
+        Provider, ProviderError, ToolCall, Usage,
     };
 
     #[test]
@@ -109,7 +124,7 @@ mod tests {
                 cached_input_tokens: 4,
                 output_tokens: 8,
             }),
-            ModelEvent::Done,
+            ModelEvent::Finished(CompletionOutcome::Complete),
         ];
 
         assert_eq!(
@@ -128,7 +143,55 @@ mod tests {
                 output_tokens: 8,
             })
         );
-        assert_eq!(events[4], ModelEvent::Done);
+        assert_eq!(events[4], ModelEvent::Finished(CompletionOutcome::Complete));
+        assert_ne!(
+            ModelEvent::Finished(CompletionOutcome::Complete),
+            ModelEvent::Finished(CompletionOutcome::LengthLimited)
+        );
+    }
+
+    #[test]
+    fn model_metadata_preserves_optional_normalized_pricing() {
+        let metadata = ModelMetadata {
+            model_id: "priced-model".to_owned(),
+            display_name: "Priced model".to_owned(),
+            limits: ModelLimits {
+                context_window_tokens: 16_384,
+                maximum_output_tokens: Some(2_048),
+            },
+            prompt_price_usd_per_million_tokens: Some("0.15".to_owned()),
+            completion_price_usd_per_million_tokens: Some("0.60".to_owned()),
+        };
+
+        assert_eq!(
+            metadata,
+            ModelMetadata {
+                model_id: "priced-model".to_owned(),
+                display_name: "Priced model".to_owned(),
+                limits: ModelLimits {
+                    context_window_tokens: 16_384,
+                    maximum_output_tokens: Some(2_048),
+                },
+                prompt_price_usd_per_million_tokens: Some("0.15".to_owned()),
+                completion_price_usd_per_million_tokens: Some("0.60".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn model_limits_distinguish_known_and_unknown_output_limits() {
+        let known_limits = ModelLimits {
+            context_window_tokens: 16_384,
+            maximum_output_tokens: Some(2_048),
+        };
+        let unknown_limits = ModelLimits {
+            context_window_tokens: 16_384,
+            maximum_output_tokens: None,
+        };
+
+        assert_ne!(known_limits, unknown_limits);
+        assert_eq!(known_limits.maximum_output_tokens, Some(2_048));
+        assert_eq!(unknown_limits.maximum_output_tokens, None);
     }
 
     #[test]
@@ -161,9 +224,30 @@ mod tests {
                 display_name: MOCK_MODEL_NAME.to_owned(),
                 limits: ModelLimits {
                     context_window_tokens: 8_192,
-                    maximum_output_tokens: 1_024,
+                    maximum_output_tokens: Some(1_024),
                 },
+                prompt_price_usd_per_million_tokens: None,
+                completion_price_usd_per_million_tokens: None,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_is_usable_through_a_dyn_provider() {
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new());
+
+        assert_eq!(
+            provider.models().await,
+            Ok(vec![ModelMetadata {
+                model_id: MOCK_MODEL_NAME.to_owned(),
+                display_name: MOCK_MODEL_NAME.to_owned(),
+                limits: ModelLimits {
+                    context_window_tokens: 8_192,
+                    maximum_output_tokens: Some(1_024),
+                },
+                prompt_price_usd_per_million_tokens: None,
+                completion_price_usd_per_million_tokens: None,
+            }])
         );
     }
 }

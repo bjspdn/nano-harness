@@ -1,5 +1,8 @@
+use crate::provider::{CompletionOutcome, ModelMetadata, Usage};
 use crate::runtime::HarnessEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use super::model_picker::{ModelPickerAction, ModelPickerState};
 
 /// The role of a displayable conversation message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +37,7 @@ impl Message {
 pub enum RuntimeStatus {
     Idle,
     Responding,
+    Truncated,
     Error(String),
 }
 
@@ -42,17 +46,22 @@ pub enum RuntimeStatus {
 pub enum AppAction {
     Continue,
     Submit(String),
+    OpenModelPicker,
+    SelectModel(String),
     Exit,
 }
 
 /// Transient state projected by the TUI and consumed by rendering and orchestration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState {
+    model_id: String,
     model_name: String,
+    model_picker: ModelPickerState,
     messages: Vec<Message>,
     input: String,
     cursor_byte_offset: usize,
     runtime_status: RuntimeStatus,
+    usage: Option<Usage>,
     active_assistant_message: Option<usize>,
     top_wrapped_line_offset: usize,
     auto_follow: bool,
@@ -61,13 +70,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(model_name: impl Into<String>) -> Self {
+    pub fn new(model_id: impl Into<String>, model_name: impl Into<String>) -> Self {
         Self {
+            model_id: model_id.into(),
             model_name: model_name.into(),
+            model_picker: ModelPickerState::new(),
             messages: Vec::new(),
             input: String::new(),
             cursor_byte_offset: 0,
             runtime_status: RuntimeStatus::Idle,
+            usage: None,
             active_assistant_message: None,
             top_wrapped_line_offset: 0,
             auto_follow: true,
@@ -76,8 +88,16 @@ impl AppState {
         }
     }
 
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    pub fn model_picker(&self) -> &ModelPickerState {
+        &self.model_picker
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -95,6 +115,10 @@ impl AppState {
 
     pub fn runtime_status(&self) -> &RuntimeStatus {
         &self.runtime_status
+    }
+
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
     }
 
     pub fn is_responding(&self) -> bool {
@@ -135,6 +159,22 @@ impl AppState {
 
         if has_control_modifier && is_control_c(key_event.code) {
             return AppAction::Exit;
+        }
+
+        if has_control_modifier && is_control_p(key_event.code) {
+            if self.is_responding() {
+                return AppAction::Continue;
+            }
+
+            self.model_picker.open();
+            return AppAction::OpenModelPicker;
+        }
+
+        if self.model_picker.is_open() {
+            return match self.model_picker.handle_key(key_event, &self.model_id) {
+                ModelPickerAction::Continue => AppAction::Continue,
+                ModelPickerAction::SelectModel(model_id) => AppAction::SelectModel(model_id),
+            };
         }
 
         if key_event.code == KeyCode::Esc {
@@ -207,12 +247,28 @@ impl AppState {
         self.input.clear();
         self.cursor_byte_offset = 0;
         self.runtime_status = RuntimeStatus::Responding;
+        self.usage = None;
         self.active_assistant_message = None;
     }
 
     /// Record a failed command enqueue without losing the draft or conversation.
     pub fn reject_submission(&mut self, error: String) {
         self.runtime_status = RuntimeStatus::Error(error);
+    }
+
+    /// Record a successful model-selection command enqueue without changing the active model.
+    pub fn accept_model_selection(&mut self, model_id: String) {
+        self.model_picker.accept_selection_enqueue(model_id);
+    }
+
+    /// Record a failed model-selection command enqueue without changing the active model.
+    pub fn reject_model_selection(&mut self, error: String) {
+        self.model_picker.reject_selection_enqueue(error);
+    }
+
+    /// Record a failed model-discovery command enqueue inside the open picker.
+    pub fn reject_model_picker_open(&mut self, error: String) {
+        self.model_picker.reject_discovery_enqueue(error);
     }
 
     pub fn handle_harness_event(&mut self, harness_event: HarnessEvent) {
@@ -244,13 +300,16 @@ impl AppState {
 
                 message.content.push_str(&response_delta);
             }
-            HarnessEvent::ResponseFinished => {
+            HarnessEvent::ResponseFinished(completion_outcome) => {
                 if !self.is_responding() {
                     return;
                 }
 
                 self.active_assistant_message = None;
-                self.runtime_status = RuntimeStatus::Idle;
+                self.runtime_status = match completion_outcome {
+                    CompletionOutcome::Complete => RuntimeStatus::Idle,
+                    CompletionOutcome::LengthLimited => RuntimeStatus::Truncated,
+                };
             }
             HarnessEvent::Error(error) => {
                 if !self.is_responding() {
@@ -260,7 +319,30 @@ impl AppState {
                 self.active_assistant_message = None;
                 self.runtime_status = RuntimeStatus::Error(error);
             }
+            HarnessEvent::Usage(usage) => {
+                if !self.is_responding() {
+                    return;
+                }
+
+                self.usage = Some(usage);
+            }
+            HarnessEvent::CatalogLoading => self.model_picker.catalog_loading(),
+            HarnessEvent::CatalogLoaded(models) => self.model_picker.catalog_loaded(models),
+            HarnessEvent::CatalogFailed(error) => self.model_picker.catalog_failed(error),
+            HarnessEvent::ModelSelected(model_metadata) => {
+                self.apply_selected_model(model_metadata);
+            }
+            HarnessEvent::ModelSelectionFailed(error) => {
+                self.model_picker.selection_failed(error);
+            }
         }
+    }
+
+    fn apply_selected_model(&mut self, model_metadata: ModelMetadata) {
+        self.model_picker
+            .selection_acknowledged(&model_metadata.model_id);
+        self.model_id = model_metadata.model_id;
+        self.model_name = model_metadata.display_name;
     }
 
     pub fn update_conversation_metrics(&mut self, content_lines: usize, viewport_height: usize) {
@@ -331,9 +413,14 @@ fn is_control_c(key_code: KeyCode) -> bool {
     matches!(key_code, KeyCode::Char('c' | 'C'))
 }
 
+fn is_control_p(key_code: KeyCode) -> bool {
+    matches!(key_code, KeyCode::Char('p' | 'P'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppAction, AppState, MessageRole, RuntimeStatus};
+    use crate::provider::{CompletionOutcome, ModelLimits, ModelMetadata, Usage};
     use crate::runtime::HarnessEvent;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -351,9 +438,22 @@ mod tests {
         assert_eq!(app_state.messages()[0].content(), expected_content);
     }
 
+    fn model_metadata(model_id: &str, display_name: &str) -> ModelMetadata {
+        ModelMetadata {
+            model_id: model_id.to_owned(),
+            display_name: display_name.to_owned(),
+            limits: ModelLimits {
+                context_window_tokens: 16_384,
+                maximum_output_tokens: Some(2_048),
+            },
+            prompt_price_usd_per_million_tokens: Some("0.10".to_owned()),
+            completion_price_usd_per_million_tokens: Some("0.40".to_owned()),
+        }
+    }
+
     #[test]
     fn editor_inserts_and_moves_across_utf8_boundaries() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
 
         assert_eq!(
             app_state.handle_key(key_event(KeyCode::Char('a'))),
@@ -389,7 +489,7 @@ mod tests {
 
     #[test]
     fn printable_q_and_modified_character_rules_are_explicit() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
 
         assert_eq!(
             app_state.handle_key(key_event(KeyCode::Char('q'))),
@@ -407,7 +507,7 @@ mod tests {
 
     #[test]
     fn enter_ignores_empty_input_and_preserves_draft_while_responding() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
 
         assert_eq!(
             app_state.handle_key(key_event(KeyCode::Enter)),
@@ -432,7 +532,7 @@ mod tests {
 
     #[test]
     fn esc_clears_non_empty_draft_then_exits_when_empty() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.handle_key(key_event(KeyCode::Char('x')));
 
         assert_eq!(
@@ -449,7 +549,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_exits_and_release_events_do_not_mutate_state() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         let mut release_event = key_event(KeyCode::Char('x'));
         release_event.kind = KeyEventKind::Release;
 
@@ -466,7 +566,7 @@ mod tests {
 
     #[test]
     fn accepted_submission_commits_all_state_together() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         for character in "  hello  ".chars() {
             app_state.handle_key(key_event(KeyCode::Char(character)));
         }
@@ -487,11 +587,12 @@ mod tests {
         assert_eq!(app_state.input(), "");
         assert_eq!(app_state.cursor_byte_offset(), 0);
         assert_eq!(app_state.runtime_status(), &RuntimeStatus::Responding);
+        assert_eq!(app_state.usage(), None);
     }
 
     #[test]
     fn rejected_submission_preserves_draft_cursor_and_messages() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.handle_key(key_event(KeyCode::Char('a')));
         app_state.handle_key(key_event(KeyCode::Char('é')));
         app_state.handle_key(key_event(KeyCode::Left));
@@ -516,7 +617,7 @@ mod tests {
 
     #[test]
     fn complete_runtime_events_append_one_ordered_assistant_message() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.accept_submission("request".to_owned());
         app_state.handle_harness_event(HarnessEvent::ResponseStarted);
         app_state.handle_harness_event(HarnessEvent::AssistantDelta("first ".to_owned()));
@@ -527,7 +628,7 @@ mod tests {
         assert_eq!(app_state.messages()[1].role(), MessageRole::Assistant);
         assert_eq!(app_state.messages()[1].content(), "first second");
 
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished);
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
 
         assert_eq!(app_state.runtime_status(), &RuntimeStatus::Idle);
         assert!(!app_state.is_responding());
@@ -535,11 +636,90 @@ mod tests {
     }
 
     #[test]
+    fn usage_is_recorded_for_the_current_turn_and_cleared_by_the_next_accept() {
+        let first_usage = Usage {
+            input_tokens: 42,
+            cached_input_tokens: 17,
+            output_tokens: 99,
+        };
+        let second_usage = Usage {
+            input_tokens: 8,
+            cached_input_tokens: 3,
+            output_tokens: 5,
+        };
+        let mut app_state = AppState::new("test-model", "test-model");
+
+        app_state.accept_submission("first request".to_owned());
+        assert_eq!(app_state.usage(), None);
+        app_state.handle_harness_event(HarnessEvent::Usage(first_usage));
+        assert_eq!(app_state.usage(), Some(first_usage));
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
+        assert_eq!(app_state.usage(), Some(first_usage));
+
+        app_state.accept_submission("second request".to_owned());
+        assert_eq!(app_state.runtime_status(), &RuntimeStatus::Responding);
+        assert_eq!(app_state.usage(), None);
+
+        app_state.handle_harness_event(HarnessEvent::Usage(second_usage));
+        assert_eq!(app_state.usage(), Some(second_usage));
+    }
+
+    #[test]
+    fn rejected_submission_preserves_previous_turn_usage() {
+        let usage = Usage {
+            input_tokens: 12,
+            cached_input_tokens: 4,
+            output_tokens: 8,
+        };
+        let mut app_state = AppState::new("test-model", "test-model");
+        app_state.accept_submission("request".to_owned());
+        app_state.handle_harness_event(HarnessEvent::Usage(usage));
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
+
+        app_state.reject_submission("queue is full".to_owned());
+
+        assert_eq!(
+            app_state.runtime_status(),
+            &RuntimeStatus::Error("queue is full".to_owned())
+        );
+        assert_eq!(app_state.usage(), Some(usage));
+    }
+
+    #[test]
+    fn length_limited_completion_preserves_partial_text_and_allows_retry() {
+        let usage = Usage {
+            input_tokens: 21,
+            cached_input_tokens: 13,
+            output_tokens: 144,
+        };
+        let mut app_state = AppState::new("test-model", "test-model");
+        app_state.accept_submission("first request".to_owned());
+        app_state.handle_harness_event(HarnessEvent::ResponseStarted);
+        app_state.handle_harness_event(HarnessEvent::AssistantDelta("partial response".to_owned()));
+        app_state.handle_harness_event(HarnessEvent::Usage(usage));
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(
+            CompletionOutcome::LengthLimited,
+        ));
+
+        assert_eq!(app_state.messages()[1].content(), "partial response");
+        assert_eq!(app_state.runtime_status(), &RuntimeStatus::Truncated);
+        assert!(!app_state.is_responding());
+        assert!(app_state.active_assistant_message().is_none());
+        assert_eq!(app_state.usage(), Some(usage));
+
+        app_state.accept_submission("retry request".to_owned());
+
+        assert_eq!(app_state.runtime_status(), &RuntimeStatus::Responding);
+        assert_eq!(app_state.usage(), None);
+        assert_eq!(app_state.messages()[1].content(), "partial response");
+    }
+
+    #[test]
     fn no_text_response_finishes_without_an_assistant_message() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.accept_submission("request".to_owned());
 
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished);
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
 
         assert_eq!(app_state.runtime_status(), &RuntimeStatus::Idle);
         assert!(!app_state.is_responding());
@@ -549,10 +729,16 @@ mod tests {
 
     #[test]
     fn runtime_error_keeps_partial_response_and_allows_recovery() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.accept_submission("first request".to_owned());
         app_state.handle_harness_event(HarnessEvent::ResponseStarted);
         app_state.handle_harness_event(HarnessEvent::AssistantDelta("partial".to_owned()));
+        let usage = Usage {
+            input_tokens: 10,
+            cached_input_tokens: 6,
+            output_tokens: 4,
+        };
+        app_state.handle_harness_event(HarnessEvent::Usage(usage));
         app_state.handle_harness_event(HarnessEvent::Error("runtime failed".to_owned()));
 
         assert_eq!(app_state.messages()[1].content(), "partial");
@@ -561,6 +747,7 @@ mod tests {
             &RuntimeStatus::Error("runtime failed".to_owned())
         );
         assert!(!app_state.is_responding());
+        assert_eq!(app_state.usage(), Some(usage));
 
         app_state.handle_key(key_event(KeyCode::Char('n')));
         let next_submission = match app_state.handle_key(key_event(KeyCode::Enter)) {
@@ -570,13 +757,14 @@ mod tests {
         app_state.accept_submission(next_submission);
 
         assert_eq!(app_state.runtime_status(), &RuntimeStatus::Responding);
+        assert_eq!(app_state.usage(), None);
         assert_eq!(app_state.messages()[0].content(), "first request");
         assert_eq!(app_state.messages()[2].content(), "n");
     }
 
     #[test]
     fn runtime_error_before_response_started_unlocks_submission() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.accept_submission("first request".to_owned());
 
         app_state.handle_harness_event(HarnessEvent::Error("runtime failed".to_owned()));
@@ -600,30 +788,48 @@ mod tests {
 
     #[test]
     fn stale_runtime_events_do_not_mutate_state() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
 
+        let stale_usage = Usage {
+            input_tokens: 1,
+            cached_input_tokens: 1,
+            output_tokens: 1,
+        };
+        app_state.handle_harness_event(HarnessEvent::Usage(stale_usage));
         app_state.handle_harness_event(HarnessEvent::AssistantDelta("stale".to_owned()));
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished);
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
         app_state.handle_harness_event(HarnessEvent::Error("stale error".to_owned()));
         assert!(app_state.messages().is_empty());
         assert_eq!(app_state.runtime_status(), &RuntimeStatus::Idle);
+        assert_eq!(app_state.usage(), None);
 
         app_state.accept_submission("request".to_owned());
         app_state.handle_harness_event(HarnessEvent::ResponseStarted);
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished);
+        let current_usage = Usage {
+            input_tokens: 9,
+            cached_input_tokens: 5,
+            output_tokens: 7,
+        };
+        app_state.handle_harness_event(HarnessEvent::Usage(current_usage));
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
         let messages_after_finish = app_state.messages().to_owned();
 
+        app_state.handle_harness_event(HarnessEvent::Usage(stale_usage));
         app_state.handle_harness_event(HarnessEvent::AssistantDelta("stale".to_owned()));
         app_state.handle_harness_event(HarnessEvent::ResponseStarted);
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(
+            CompletionOutcome::LengthLimited,
+        ));
         app_state.handle_harness_event(HarnessEvent::Error("stale error".to_owned()));
 
         assert_eq!(app_state.messages(), messages_after_finish.as_slice());
         assert_eq!(app_state.runtime_status(), &RuntimeStatus::Idle);
+        assert_eq!(app_state.usage(), Some(current_usage));
     }
 
     #[test]
     fn scroll_metrics_follow_bottom_and_manual_navigation_is_stable() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.update_conversation_metrics(20, 5);
         assert_eq!(app_state.top_wrapped_line_offset(), 15);
         assert!(app_state.is_auto_following());
@@ -655,7 +861,7 @@ mod tests {
 
     #[test]
     fn scroll_metrics_clamp_without_underflow_for_zero_sized_values() {
-        let mut app_state = AppState::new("test-model");
+        let mut app_state = AppState::new("test-model", "test-model");
         app_state.update_conversation_metrics(0, 0);
         assert_eq!(app_state.top_wrapped_line_offset(), 0);
 
@@ -674,5 +880,134 @@ mod tests {
         app_state.update_conversation_metrics(0, 4);
         assert_eq!(app_state.top_wrapped_line_offset(), 0);
         assert!(app_state.is_auto_following());
+    }
+
+    #[test]
+    fn idle_ctrl_p_owns_modal_keys_without_mutating_draft_conversation_or_usage() {
+        let mut app_state = AppState::new("current-id", "Current model");
+        app_state.accept_submission("existing request".to_owned());
+        app_state.handle_harness_event(HarnessEvent::ResponseStarted);
+        app_state
+            .handle_harness_event(HarnessEvent::AssistantDelta("existing response".to_owned()));
+        let usage = Usage {
+            input_tokens: 12,
+            cached_input_tokens: 4,
+            output_tokens: 8,
+        };
+        app_state.handle_harness_event(HarnessEvent::Usage(usage));
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
+        app_state.handle_key(key_event(KeyCode::Char('d')));
+        let messages_before_picker = app_state.messages().to_owned();
+
+        assert_eq!(
+            app_state.handle_key(modified_key_event(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL,
+            )),
+            AppAction::OpenModelPicker
+        );
+        assert!(app_state.model_picker().is_open());
+        assert_eq!(app_state.input(), "d");
+        assert_eq!(app_state.messages(), messages_before_picker.as_slice());
+        assert_eq!(app_state.usage(), Some(usage));
+
+        app_state.handle_key(key_event(KeyCode::Char('q')));
+        assert_eq!(app_state.model_picker().query(), "q");
+        assert_eq!(app_state.input(), "d");
+        assert_eq!(
+            app_state.handle_key(key_event(KeyCode::Esc)),
+            AppAction::Continue
+        );
+        assert!(!app_state.model_picker().is_open());
+        assert_eq!(app_state.input(), "d");
+    }
+
+    #[test]
+    fn responding_ctrl_p_is_ignored_but_ctrl_c_remains_global() {
+        let mut app_state = AppState::new("current-id", "Current model");
+        app_state.accept_submission("request".to_owned());
+        app_state.handle_key(key_event(KeyCode::Char('d')));
+
+        assert_eq!(
+            app_state.handle_key(modified_key_event(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL,
+            )),
+            AppAction::Continue
+        );
+        assert!(!app_state.model_picker().is_open());
+        assert_eq!(app_state.input(), "d");
+        assert_eq!(
+            app_state.handle_key(modified_key_event(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )),
+            AppAction::Exit
+        );
+    }
+
+    #[test]
+    fn catalog_and_startup_selection_events_update_projection_without_closing_open_picker() {
+        let current_model = model_metadata("current-id", "Initial name");
+        let alternate_model = model_metadata("alternate-id", "Alternate name");
+        let mut app_state = AppState::new("current-id", "Initial name");
+        app_state.handle_harness_event(HarnessEvent::CatalogLoading);
+        app_state.handle_key(modified_key_event(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        ));
+        app_state.handle_key(key_event(KeyCode::Char('a')));
+        app_state.handle_harness_event(HarnessEvent::CatalogLoaded(vec![
+            current_model.clone(),
+            alternate_model.clone(),
+        ]));
+        assert_eq!(app_state.model_picker().query(), "a");
+        app_state.handle_harness_event(HarnessEvent::ModelSelected(current_model.clone()));
+
+        assert_eq!(app_state.model_id(), "current-id");
+        assert_eq!(app_state.model_name(), "Initial name");
+        assert!(app_state.model_picker().is_open());
+        assert_eq!(app_state.model_picker().pending_model_id(), None);
+
+        app_state.handle_harness_event(HarnessEvent::CatalogFailed("provider\nfailed".to_owned()));
+        assert!(matches!(
+            app_state.model_picker().catalog_state(),
+            crate::tui::model_picker::CatalogState::Failed(message) if message == "provider\nfailed"
+        ));
+        assert!(app_state.model_picker().is_open());
+    }
+
+    #[test]
+    fn model_selection_changes_only_after_matching_runtime_acknowledgment() {
+        let alternate_model = model_metadata("alternate-id", "Alternate name");
+        let mut app_state = AppState::new("current-id", "Initial name");
+        app_state.handle_key(modified_key_event(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        ));
+        app_state.handle_harness_event(HarnessEvent::CatalogLoaded(vec![alternate_model.clone()]));
+        app_state.accept_model_selection("alternate-id".to_owned());
+
+        assert_eq!(app_state.model_id(), "current-id");
+        assert_eq!(app_state.model_name(), "Initial name");
+        assert!(app_state.model_picker().is_open());
+
+        app_state.handle_harness_event(HarnessEvent::ModelSelectionFailed(
+            "model is no longer available".to_owned(),
+        ));
+        assert!(app_state.model_picker().is_open());
+        assert_eq!(app_state.model_picker().pending_model_id(), None);
+        assert_eq!(app_state.model_id(), "current-id");
+        assert_eq!(app_state.model_name(), "Initial name");
+        assert_eq!(
+            app_state.model_picker().error(),
+            Some("model is no longer available")
+        );
+
+        app_state.accept_model_selection("alternate-id".to_owned());
+        app_state.handle_harness_event(HarnessEvent::ModelSelected(alternate_model));
+        assert_eq!(app_state.model_id(), "alternate-id");
+        assert_eq!(app_state.model_name(), "Alternate name");
+        assert!(!app_state.model_picker().is_open());
     }
 }

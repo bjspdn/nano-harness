@@ -121,8 +121,8 @@ ctx 103k · left 13.3% · cache 98.1% · out 1.4k
 
 Initial providers:
 
-- OpenAI API
 - OpenRouter
+- OpenAI API
 - OpenCode Go
 
 Codex can be added later.

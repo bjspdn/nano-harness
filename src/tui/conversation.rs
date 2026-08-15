@@ -1,6 +1,5 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
@@ -86,24 +85,81 @@ fn wrap_line(content: &str, width: usize, wrapped_lines: &mut Vec<Line<'static>>
         return;
     }
 
-    let source_line = Line::from(content);
-    let mut current_line = String::new();
-
-    for grapheme in source_line.styled_graphemes(Style::default()) {
-        let mut candidate_line = current_line.clone();
-        candidate_line.push_str(grapheme.symbol);
-
-        if !current_line.is_empty() && display_width(&candidate_line) > width {
-            wrapped_lines.push(Line::from(current_line));
-            current_line = String::new();
-        }
-
-        current_line.push_str(grapheme.symbol);
+    let wrap_options = textwrap::Options::new(width).break_words(true);
+    for wrapped_content in textwrap::wrap(content, wrap_options) {
+        wrapped_lines.push(Line::from(wrapped_content.into_owned()));
     }
-
-    wrapped_lines.push(Line::from(current_line));
 }
 
-fn display_width(content: &str) -> usize {
-    Line::from(content).width()
+#[cfg(test)]
+mod tests {
+    use ratatui::text::Line;
+
+    use super::{wrap_line, wrap_messages};
+    use crate::tui::app::{Message, MessageRole};
+
+    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(ToString::to_string).collect()
+    }
+
+    fn wrapped_line_texts(messages: &[Message], width: u16) -> Vec<String> {
+        let wrapped_lines = wrap_messages(messages, width);
+        (0..wrapped_lines.len())
+            .map(|line_index| {
+                wrapped_lines
+                    .get(line_index)
+                    .expect("line index should be within wrapped lines")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prose_wraps_at_word_boundaries() {
+        let mut wrapped_lines = Vec::new();
+
+        wrap_line("some that", 8, &mut wrapped_lines);
+
+        assert_eq!(line_texts(&wrapped_lines), ["some", "that"]);
+    }
+
+    #[test]
+    fn overlong_words_still_break_within_width() {
+        let mut wrapped_lines = Vec::new();
+
+        wrap_line("abcdefgh", 3, &mut wrapped_lines);
+
+        assert_eq!(line_texts(&wrapped_lines), ["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn unicode_line_breaks_respect_display_width() {
+        let mut wrapped_lines = Vec::new();
+
+        wrap_line("日本語東京", 6, &mut wrapped_lines);
+
+        assert_eq!(line_texts(&wrapped_lines), ["日本語", "東京"]);
+        assert!(wrapped_lines.iter().all(|line| line.width() <= 6));
+    }
+
+    #[test]
+    fn explicit_empty_lines_and_zero_width_are_preserved() {
+        let messages = [Message::new(MessageRole::User, "\nsecond\n".to_owned())];
+
+        assert_eq!(wrapped_line_texts(&messages, 10), ["You:", "second", ""]);
+        assert!(wrap_messages(&messages, 0).lines.is_empty());
+    }
+
+    #[test]
+    fn role_prefix_only_applies_to_the_first_content_line() {
+        let messages = [Message::new(
+            MessageRole::Assistant,
+            "first\nsecond".to_owned(),
+        )];
+
+        assert_eq!(
+            wrapped_line_texts(&messages, 20),
+            ["Assistant: first", "second"]
+        );
+    }
 }

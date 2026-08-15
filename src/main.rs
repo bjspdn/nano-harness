@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use provider::{FakeProvider, MOCK_MODEL_NAME, Provider};
+use provider::{ModelMetadata, OPENROUTER_DEFAULT_MODEL_ID, OpenRouterProvider, Provider};
 use runtime::{HarnessEvent, RuntimeCommand};
 use tui::{AppAction, AppState};
 
@@ -24,11 +24,9 @@ const LOOP_TICK: Duration = Duration::from_millis(16);
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new());
-    let model_metadata = provider
-        .model_metadata(MOCK_MODEL_NAME)
-        .context("failed to resolve fake model metadata")?;
+    let (provider, model_metadata) = initialize_provider()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
         .context("failed to build current-thread Tokio runtime")?;
@@ -44,6 +42,16 @@ fn main() -> Result<()> {
     .context("failed to run app")
 }
 
+fn initialize_provider() -> Result<(Arc<dyn Provider>, ModelMetadata)> {
+    let provider: Arc<dyn Provider> =
+        Arc::new(OpenRouterProvider::new().context("failed to construct OpenRouter provider")?);
+    let model_metadata = provider
+        .model_metadata(OPENROUTER_DEFAULT_MODEL_ID)
+        .context("failed to resolve OpenRouter default model metadata")?;
+
+    Ok((provider, model_metadata))
+}
+
 async fn run(
     terminal: &mut DefaultTerminal,
     provider: Arc<dyn Provider>,
@@ -51,8 +59,8 @@ async fn run(
     model_display_name: String,
 ) -> Result<()> {
     let (command_sender, mut event_receiver, task_handle) =
-        runtime::spawn_runtime(provider, model_id);
-    let mut app_state = AppState::new(model_display_name);
+        runtime::spawn_runtime(provider, model_id.clone());
+    let mut app_state = AppState::new(model_id, model_display_name);
 
     let loop_result = async {
         draw(terminal, &mut app_state)?;
@@ -162,6 +170,29 @@ fn dispatch_action(
             }
             true
         }
+        AppAction::OpenModelPicker => {
+            match command_sender.try_send(RuntimeCommand::DiscoverModels) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    app_state.reject_model_picker_open("runtime command queue is full".to_owned())
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => app_state
+                    .reject_model_picker_open("runtime command channel is closed".to_owned()),
+            }
+            true
+        }
+        AppAction::SelectModel(model_id) => {
+            match command_sender.try_send(RuntimeCommand::SelectModel(model_id.clone())) {
+                Ok(()) => app_state.accept_model_selection(model_id),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    app_state.reject_model_selection("runtime command queue is full".to_owned())
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    app_state.reject_model_selection("runtime command channel is closed".to_owned())
+                }
+            }
+            true
+        }
     }
 }
 
@@ -190,7 +221,10 @@ async fn shutdown_runtime(
 
 #[cfg(test)]
 mod main_tests {
-    use super::dispatch_action;
+    use super::{dispatch_action, initialize_provider};
+    use crate::provider::{
+        CompletionOutcome, ModelLimits, ModelMetadata, OPENROUTER_DEFAULT_MODEL_ID,
+    };
     use crate::runtime::{HarnessEvent, RuntimeCommand};
     use crate::tui::AppState;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -206,20 +240,50 @@ mod main_tests {
         }
     }
 
+    fn model_metadata(model_id: &str, display_name: &str) -> ModelMetadata {
+        ModelMetadata {
+            model_id: model_id.to_owned(),
+            display_name: display_name.to_owned(),
+            limits: ModelLimits {
+                context_window_tokens: 16_384,
+                maximum_output_tokens: Some(2_048),
+            },
+            prompt_price_usd_per_million_tokens: Some("0.10".to_owned()),
+            completion_price_usd_per_million_tokens: Some("0.40".to_owned()),
+        }
+    }
+
     fn settled_app_state() -> AppState {
-        let mut app_state = AppState::new("mock-runtime");
+        let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state.accept_submission("existing request".to_owned());
         app_state.handle_harness_event(HarnessEvent::ResponseStarted);
         app_state
             .handle_harness_event(HarnessEvent::AssistantDelta("existing response".to_owned()));
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished);
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
         app_state
+    }
+
+    #[test]
+    fn startup_initializes_the_pinned_openrouter_default_without_credentials_or_network() {
+        let (_provider, metadata) =
+            initialize_provider().expect("OpenRouter startup should not require credentials");
+
+        assert_eq!(
+            OPENROUTER_DEFAULT_MODEL_ID,
+            "deepseek/deepseek-v4-flash-0731"
+        );
+        assert_eq!(metadata.model_id, OPENROUTER_DEFAULT_MODEL_ID);
+        assert_eq!(metadata.display_name, "DeepSeek: DeepSeek V4 Flash 0731");
+        assert_eq!(metadata.limits.context_window_tokens, 1_048_576);
+        assert_eq!(metadata.limits.maximum_output_tokens, Some(393_216));
+        assert_eq!(metadata.prompt_price_usd_per_million_tokens, None);
+        assert_eq!(metadata.completion_price_usd_per_million_tokens, None);
     }
 
     #[test]
     fn successful_enqueue_commits_submission_once() {
         let (command_sender, mut command_receiver) = mpsc::channel(1);
-        let mut app_state = AppState::new("mock-runtime");
+        let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         type_input(&mut app_state, "hello");
 
         assert!(dispatch_action(
@@ -316,7 +380,7 @@ mod main_tests {
     #[test]
     fn responding_enter_does_not_enqueue_or_clear_next_draft() {
         let (command_sender, mut command_receiver) = mpsc::channel(1);
-        let mut app_state = AppState::new("mock-runtime");
+        let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state.accept_submission("first request".to_owned());
         type_input(&mut app_state, "second request");
 
@@ -330,5 +394,102 @@ mod main_tests {
         assert_eq!(app_state.messages().len(), 1);
         assert!(app_state.is_responding());
         assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn picker_actions_enqueue_runtime_commands_and_wait_for_selection_acknowledgment() {
+        let (command_sender, mut command_receiver) = mpsc::channel(4);
+        let alternate_model = model_metadata("alternate-id", "Alternate model");
+        let mut app_state = AppState::new("current-id", "Current model");
+        type_input(&mut app_state, "draft");
+
+        assert!(dispatch_action(
+            &mut app_state,
+            &command_sender,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ));
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(RuntimeCommand::DiscoverModels)
+        );
+        app_state.handle_harness_event(HarnessEvent::CatalogLoaded(vec![alternate_model.clone()]));
+
+        assert!(dispatch_action(
+            &mut app_state,
+            &command_sender,
+            key_event(KeyCode::Enter),
+        ));
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(RuntimeCommand::SelectModel("alternate-id".to_owned()))
+        );
+        assert_eq!(app_state.model_id(), "current-id");
+        assert_eq!(app_state.input(), "draft");
+        assert_eq!(
+            app_state.model_picker().pending_model_id(),
+            Some("alternate-id")
+        );
+        assert!(app_state.model_picker().is_open());
+
+        app_state.handle_harness_event(HarnessEvent::ModelSelected(alternate_model));
+        assert_eq!(app_state.model_id(), "alternate-id");
+        assert_eq!(app_state.model_name(), "Alternate model");
+        assert_eq!(app_state.input(), "draft");
+        assert!(!app_state.model_picker().is_open());
+    }
+
+    #[test]
+    fn picker_enqueue_rejection_preserves_selection_and_draft() {
+        let (command_sender, mut command_receiver) = mpsc::channel(1);
+        let alternate_model = model_metadata("alternate-id", "Alternate model");
+        let mut app_state = AppState::new("current-id", "Current model");
+        type_input(&mut app_state, "draft");
+        dispatch_action(
+            &mut app_state,
+            &command_sender,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        command_receiver
+            .try_recv()
+            .expect("discovery command should be queued");
+        app_state.handle_harness_event(HarnessEvent::CatalogLoaded(vec![alternate_model]));
+        command_sender
+            .try_send(RuntimeCommand::Submit("already queued".to_owned()))
+            .expect("the test command should fill the queue");
+
+        assert!(dispatch_action(
+            &mut app_state,
+            &command_sender,
+            key_event(KeyCode::Enter),
+        ));
+        assert_eq!(app_state.model_id(), "current-id");
+        assert_eq!(app_state.input(), "draft");
+        assert!(app_state.model_picker().is_open());
+        assert_eq!(app_state.model_picker().pending_model_id(), None);
+        assert!(matches!(
+            app_state.model_picker().error(),
+            Some(error) if error.contains("full")
+        ));
+    }
+
+    #[test]
+    fn picker_open_rejection_is_local_to_the_open_modal() {
+        let (command_sender, command_receiver) = mpsc::channel(1);
+        drop(command_receiver);
+        let mut app_state = AppState::new("current-id", "Current model");
+        type_input(&mut app_state, "draft");
+
+        assert!(dispatch_action(
+            &mut app_state,
+            &command_sender,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ));
+        assert!(app_state.model_picker().is_open());
+        assert_eq!(app_state.model_id(), "current-id");
+        assert_eq!(app_state.input(), "draft");
+        assert!(matches!(
+            app_state.model_picker().error(),
+            Some(error) if error.contains("closed")
+        ));
     }
 }

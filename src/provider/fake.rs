@@ -3,7 +3,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
-use super::{ModelEvent, ModelLimits, ModelMetadata, ModelRequest, ModelStream, Provider};
+use super::{
+    CompletionOutcome, ModelEvent, ModelLimits, ModelMetadata, ModelRequest, ModelStream, Provider,
+};
 use super::{ProviderError, Usage};
 
 /// Identifier and display name for the deterministic fake model.
@@ -18,7 +20,7 @@ const MOCK_RESPONSE_CHUNKS: [&str; 3] = [
 ];
 const MOCK_MODEL_LIMITS: ModelLimits = ModelLimits {
     context_window_tokens: 8_192,
-    maximum_output_tokens: 1_024,
+    maximum_output_tokens: Some(1_024),
 };
 const MOCK_USAGE: Usage = Usage {
     input_tokens: 24,
@@ -41,11 +43,11 @@ impl Provider for FakeProvider {
     fn model_metadata(&self, model_id: &str) -> Result<ModelMetadata, ProviderError> {
         ensure_known_model(model_id)?;
 
-        Ok(ModelMetadata {
-            model_id: MOCK_MODEL_NAME.to_owned(),
-            display_name: MOCK_MODEL_NAME.to_owned(),
-            limits: MOCK_MODEL_LIMITS,
-        })
+        Ok(mock_model_metadata())
+    }
+
+    async fn models(&self) -> Result<Vec<ModelMetadata>, ProviderError> {
+        Ok(vec![mock_model_metadata()])
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProviderError> {
@@ -53,6 +55,16 @@ impl Provider for FakeProvider {
 
         let (model_stream, _producer_completion) = spawn_fake_stream();
         Ok(model_stream)
+    }
+}
+
+fn mock_model_metadata() -> ModelMetadata {
+    ModelMetadata {
+        model_id: MOCK_MODEL_NAME.to_owned(),
+        display_name: MOCK_MODEL_NAME.to_owned(),
+        limits: MOCK_MODEL_LIMITS,
+        prompt_price_usd_per_million_tokens: None,
+        completion_price_usd_per_million_tokens: None,
     }
 }
 
@@ -100,7 +112,7 @@ async fn emit_fake_response(
         .await
         .map_err(|_| ())?;
     event_sender
-        .send(Ok(ModelEvent::Done))
+        .send(Ok(ModelEvent::Finished(CompletionOutcome::Complete)))
         .await
         .map_err(|_| ())
 }
@@ -109,27 +121,20 @@ async fn emit_fake_response(
 mod tests {
     use super::{
         FakeProvider, MOCK_MODEL_NAME, MOCK_RESPONSE_CHUNKS, MOCK_RESPONSE_DELAY, MOCK_USAGE,
-        spawn_fake_stream,
+        mock_model_metadata, spawn_fake_stream,
     };
-    use crate::provider::{
-        ModelEvent, ModelLimits, ModelMetadata, ModelRequest, Provider, ProviderError,
-    };
+    use crate::provider::{CompletionOutcome, ModelEvent, ModelRequest, Provider, ProviderError};
 
-    #[test]
-    fn known_model_returns_canonical_metadata_and_limits() {
+    #[tokio::test]
+    async fn catalog_and_metadata_return_one_canonical_model_without_pricing() {
         let provider = FakeProvider::new();
+        let expected_metadata = mock_model_metadata();
 
         assert_eq!(
             provider.model_metadata(MOCK_MODEL_NAME),
-            Ok(ModelMetadata {
-                model_id: MOCK_MODEL_NAME.to_owned(),
-                display_name: MOCK_MODEL_NAME.to_owned(),
-                limits: ModelLimits {
-                    context_window_tokens: 8_192,
-                    maximum_output_tokens: 1_024,
-                },
-            })
+            Ok(expected_metadata.clone())
         );
+        assert_eq!(provider.models().await, Ok(vec![expected_metadata]));
     }
 
     #[test]
@@ -170,7 +175,7 @@ mod tests {
             Ok(ModelEvent::TextDelta(MOCK_RESPONSE_CHUNKS[1].to_owned())),
             Ok(ModelEvent::TextDelta(MOCK_RESPONSE_CHUNKS[2].to_owned())),
             Ok(ModelEvent::Usage(MOCK_USAGE)),
-            Ok(ModelEvent::Done),
+            Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
         ];
 
         assert_eq!(first_events, expected_events);
@@ -239,13 +244,18 @@ mod tests {
             .recv()
             .await
             .expect("fake stream should emit one terminal event");
-        assert_eq!(done_event, Ok(ModelEvent::Done));
+        assert_eq!(
+            done_event,
+            Ok(ModelEvent::Finished(CompletionOutcome::Complete))
+        );
         events.push(done_event);
 
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, Ok(ModelEvent::Done)))
+                .filter(|event| {
+                    matches!(event, Ok(ModelEvent::Finished(CompletionOutcome::Complete)))
+                })
                 .count(),
             1
         );

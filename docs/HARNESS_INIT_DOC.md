@@ -381,8 +381,8 @@ nano should initially target a deliberately small provider set:
 
 ```text
 OpenRouter
-OpenCode Go
 OpenAI API
+OpenCode Go
 ```
 
 Codex support can be added later.
@@ -404,8 +404,8 @@ A simple module layout is enough:
 ```text
 src/provider/
 ├── mod.rs
-├── openai.rs
 ├── openrouter.rs
+├── openai.rs
 └── opencode_go.rs
 ```
 
