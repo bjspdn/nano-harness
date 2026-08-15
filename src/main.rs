@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 mod prompt;
@@ -15,24 +16,43 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use runtime::{HarnessEvent, MOCK_MODEL_NAME, RuntimeCommand};
+use provider::{FakeProvider, MOCK_MODEL_NAME, Provider};
+use runtime::{HarnessEvent, RuntimeCommand};
 use tui::{AppAction, AppState};
 
 const LOOP_TICK: Duration = Duration::from_millis(16);
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new());
+    let model_metadata = provider
+        .model_metadata(MOCK_MODEL_NAME)
+        .context("failed to resolve fake model metadata")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .context("failed to build current-thread Tokio runtime")?;
 
-    ratatui::run(|terminal| runtime.block_on(run(terminal))).context("failed to run app")
+    ratatui::run(|terminal| {
+        runtime.block_on(run(
+            terminal,
+            provider,
+            model_metadata.model_id,
+            model_metadata.display_name,
+        ))
+    })
+    .context("failed to run app")
 }
 
-async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
-    let (command_sender, mut event_receiver, task_handle) = runtime::spawn_mock_runtime();
-    let mut app_state = AppState::new(MOCK_MODEL_NAME);
+async fn run(
+    terminal: &mut DefaultTerminal,
+    provider: Arc<dyn Provider>,
+    model_id: String,
+    model_display_name: String,
+) -> Result<()> {
+    let (command_sender, mut event_receiver, task_handle) =
+        runtime::spawn_runtime(provider, model_id);
+    let mut app_state = AppState::new(model_display_name);
 
     let loop_result = async {
         draw(terminal, &mut app_state)?;
@@ -162,8 +182,9 @@ async fn shutdown_runtime(
     match task_handle.await {
         Ok(()) => Ok(()),
         Err(join_error) if join_error.is_cancelled() => Ok(()),
-        Err(join_error) => Err(eyre!("unexpected task join error: {join_error}"))
-            .context("mock runtime task failed"),
+        Err(join_error) => {
+            Err(eyre!("unexpected task join error: {join_error}")).context("runtime task failed")
+        }
     }
 }
 

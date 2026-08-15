@@ -135,15 +135,15 @@ Define the smallest provider-neutral API nano needs.
 
 ## Features
 
-- [ ] `Provider` trait
-- [ ] `ModelRequest`
-- [ ] streaming model events
-- [ ] text deltas
-- [ ] tool-call events
-- [ ] usage reporting
-- [ ] provider errors
-- [ ] model metadata
-- [ ] model context-window limits
+- [x] `Provider` trait
+- [x] `ModelRequest`
+- [x] streaming model events
+- [x] text deltas
+- [x] tool-call events
+- [x] usage reporting
+- [x] provider errors
+- [x] model metadata
+- [x] model context-window limits
 
 ## Suggested Core Interface
 

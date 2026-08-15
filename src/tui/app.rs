@@ -245,7 +245,7 @@ impl AppState {
                 message.content.push_str(&response_delta);
             }
             HarnessEvent::ResponseFinished => {
-                if !self.is_responding() || self.active_assistant_message.is_none() {
+                if !self.is_responding() {
                     return;
                 }
 
@@ -531,6 +531,19 @@ mod tests {
 
         assert_eq!(app_state.runtime_status(), &RuntimeStatus::Idle);
         assert!(!app_state.is_responding());
+        assert!(app_state.active_assistant_message().is_none());
+    }
+
+    #[test]
+    fn no_text_response_finishes_without_an_assistant_message() {
+        let mut app_state = AppState::new("test-model");
+        app_state.accept_submission("request".to_owned());
+
+        app_state.handle_harness_event(HarnessEvent::ResponseFinished);
+
+        assert_eq!(app_state.runtime_status(), &RuntimeStatus::Idle);
+        assert!(!app_state.is_responding());
+        assert_user_message(&app_state, "request");
         assert!(app_state.active_assistant_message().is_none());
     }
 
