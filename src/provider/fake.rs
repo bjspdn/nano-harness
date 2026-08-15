@@ -123,7 +123,9 @@ mod tests {
         FakeProvider, MOCK_MODEL_NAME, MOCK_RESPONSE_CHUNKS, MOCK_RESPONSE_DELAY, MOCK_USAGE,
         mock_model_metadata, spawn_fake_stream,
     };
-    use crate::provider::{CompletionOutcome, ModelEvent, ModelRequest, Provider, ProviderError};
+    use crate::provider::{
+        CompletionOutcome, ModelEvent, ModelMessage, ModelRequest, Provider, ProviderError,
+    };
 
     #[tokio::test]
     async fn catalog_and_metadata_return_one_canonical_model_without_pricing() {
@@ -155,7 +157,9 @@ mod tests {
         let mut first_stream = provider
             .stream(ModelRequest {
                 model_id: MOCK_MODEL_NAME.to_owned(),
-                input: "first input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "first input".to_owned(),
+                }],
             })
             .await
             .expect("known model should start streaming");
@@ -164,7 +168,9 @@ mod tests {
         let mut second_stream = provider
             .stream(ModelRequest {
                 model_id: MOCK_MODEL_NAME.to_owned(),
-                input: "different input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "different input".to_owned(),
+                }],
             })
             .await
             .expect("known model should start streaming");
@@ -191,7 +197,9 @@ mod tests {
         let result = provider
             .stream(ModelRequest {
                 model_id: "missing-model".to_owned(),
-                input: "input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "input".to_owned(),
+                }],
             })
             .await;
 

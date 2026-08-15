@@ -13,11 +13,29 @@ mod openrouter;
 pub use fake::{FakeProvider, MOCK_MODEL_NAME};
 pub use openrouter::{OPENROUTER_DEFAULT_MODEL_ID, OpenRouterProvider};
 
-/// The input submitted to a provider for one model request.
+/// One ordered provider-neutral message in a model request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelMessage {
+    User {
+        content: String,
+    },
+    #[allow(dead_code)] // Required contract variant; session history producers are deferred.
+    Assistant {
+        content: String,
+        tool_calls: Vec<ToolCall>,
+    },
+    #[allow(dead_code)] // Required contract variant; session history producers are deferred.
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+/// The ordered messages submitted to a provider for one model request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
     pub model_id: String,
-    pub input: String,
+    pub messages: Vec<ModelMessage>,
 }
 
 /// The limits advertised by a model.
@@ -105,8 +123,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CompletionOutcome, FakeProvider, MOCK_MODEL_NAME, ModelEvent, ModelLimits, ModelMetadata,
-        Provider, ProviderError, ToolCall, Usage,
+        CompletionOutcome, FakeProvider, MOCK_MODEL_NAME, ModelEvent, ModelLimits, ModelMessage,
+        ModelMetadata, ModelRequest, Provider, ProviderError, ToolCall, Usage,
     };
 
     #[test]
@@ -147,6 +165,57 @@ mod tests {
         assert_ne!(
             ModelEvent::Finished(CompletionOutcome::Complete),
             ModelEvent::Finished(CompletionOutcome::LengthLimited)
+        );
+    }
+
+    #[test]
+    fn model_request_preserves_ordered_neutral_message_data() {
+        let request = ModelRequest {
+            model_id: "provider/model".to_owned(),
+            messages: vec![
+                ModelMessage::User {
+                    content: "find a Rust book".to_owned(),
+                },
+                ModelMessage::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        tool_call_id: "call-1".to_owned(),
+                        tool_name: "search".to_owned(),
+                        arguments: json!({"query": "Rust"}),
+                    }],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call-1".to_owned(),
+                    content: "Rust book found".to_owned(),
+                },
+                ModelMessage::User {
+                    content: "summarize it".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            request.messages,
+            vec![
+                ModelMessage::User {
+                    content: "find a Rust book".to_owned(),
+                },
+                ModelMessage::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        tool_call_id: "call-1".to_owned(),
+                        tool_name: "search".to_owned(),
+                        arguments: json!({"query": "Rust"}),
+                    }],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call-1".to_owned(),
+                    content: "Rust book found".to_owned(),
+                },
+                ModelMessage::User {
+                    content: "summarize it".to_owned(),
+                },
+            ]
         );
     }
 

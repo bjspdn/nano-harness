@@ -100,14 +100,32 @@ Verify the following:
    usable.
 2. When idle, press `Ctrl-P`, search by part of a model name or ID, and close
    the picker with `Esc` or select a model with `Enter`.
-3. Submit a harmless, short prompt such as `Reply with one short line about
-   the number 2.` and observe streamed text plus raw `in`, `cache`, and `out`
-   usage.
-4. Submit a second harmless prompt and confirm it is an independent turn.
-5. Optionally, in a separate run, use a deliberately invalid placeholder such
-   as `not-a-real-key` and confirm that the authentication error is readable
-   and does not echo the credential.
-6. Exit with `Ctrl-C` and confirm the terminal restores cleanly.
+3. Submit a harmless, short prompt such as `Remember this unique fact: the
+   lighthouse code is cobalt-7. Reply with one short confirmation.` Wait for
+   the assistant response to finish, and observe streamed text plus raw `in`,
+   `cache`, and `out` usage.
+4. While nano is idle after the first response and before the next submission,
+   press `Ctrl-P`. If at least two usable loaded models are available, select a
+   different model with `Enter`, wait for the selection to be accepted, and
+   verify that the picker closes and the status line's `model:` display changes
+   to the selected model. If only one usable model is available, continue
+   without a switch; a rejected or unavailable selection does not count as a
+   successful switch check.
+5. In the same running process, submit `What was the lighthouse code? Reply
+   with only the code.` Do not repeat the code in this second prompt. The
+   response should use the first-turn fact and answer `cobalt-7`, including
+   after an accepted model switch.
+6. For failure and recovery, start a separate run with a deliberately invalid
+   placeholder such as `not-a-real-key`. Submit a harmless prompt and confirm
+   that the surfaced authentication error is readable, does not echo the
+   credential, and leaves nano ready to accept another submission. Make that
+   later submission to verify input recovery in the failed run; it may surface
+   another error, and nano must not imply an automatic retry. Stop that run,
+   restore a valid credential, and restart as necessary. In the new run,
+   submit a fresh short valid prompt and confirm it can be submitted and
+   completes. Do not claim that the failed run's conversation survives the
+   restart.
+7. Exit each nano run with `Ctrl-C` and confirm the terminal restores cleanly.
 
 Normal checks remain credential-free:
 

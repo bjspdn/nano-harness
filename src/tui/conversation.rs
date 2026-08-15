@@ -96,6 +96,7 @@ mod tests {
     use ratatui::text::Line;
 
     use super::{wrap_line, wrap_messages};
+    use crate::session::MessageId;
     use crate::tui::app::{Message, MessageRole};
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
@@ -144,7 +145,11 @@ mod tests {
 
     #[test]
     fn explicit_empty_lines_and_zero_width_are_preserved() {
-        let messages = [Message::new(MessageRole::User, "\nsecond\n".to_owned())];
+        let messages = [Message::new(
+            MessageId::from_u64(1),
+            MessageRole::User,
+            "\nsecond\n".to_owned(),
+        )];
 
         assert_eq!(wrapped_line_texts(&messages, 10), ["You:", "second", ""]);
         assert!(wrap_messages(&messages, 0).lines.is_empty());
@@ -153,6 +158,7 @@ mod tests {
     #[test]
     fn role_prefix_only_applies_to_the_first_content_line() {
         let messages = [Message::new(
+            MessageId::from_u64(1),
             MessageRole::Assistant,
             "first\nsecond".to_owned(),
         )];

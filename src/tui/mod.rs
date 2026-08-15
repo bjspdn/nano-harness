@@ -77,6 +77,7 @@ mod tests {
     use super::{AppState, conversation, render};
     use crate::provider::{CompletionOutcome, ModelLimits, ModelMetadata, Usage};
     use crate::runtime::HarnessEvent;
+    use crate::session::{MessageId, RunId};
 
     fn draw(terminal: &mut Terminal<TestBackend>, app_state: &mut AppState) {
         terminal
@@ -112,6 +113,58 @@ mod tests {
         KeyEvent::new(key_code, KeyModifiers::NONE)
     }
 
+    fn run_id(value: u64) -> RunId {
+        RunId::from_u64(value)
+    }
+
+    fn message_id(value: u64) -> MessageId {
+        MessageId::from_u64(value)
+    }
+
+    fn run_started(content: &str) -> HarnessEvent {
+        HarnessEvent::RunStarted {
+            run_id: run_id(1),
+            user_message_id: message_id(1),
+            content: content.to_owned(),
+        }
+    }
+
+    fn assistant_started() -> HarnessEvent {
+        HarnessEvent::AssistantStarted {
+            run_id: run_id(1),
+            assistant_message_id: message_id(2),
+        }
+    }
+
+    fn assistant_delta(text: &str) -> HarnessEvent {
+        HarnessEvent::AssistantDelta {
+            run_id: run_id(1),
+            assistant_message_id: message_id(2),
+            text: text.to_owned(),
+        }
+    }
+
+    fn addressed_usage(usage: Usage) -> HarnessEvent {
+        HarnessEvent::Usage {
+            run_id: run_id(1),
+            usage,
+        }
+    }
+
+    fn run_finished(completion_outcome: CompletionOutcome) -> HarnessEvent {
+        HarnessEvent::RunFinished {
+            run_id: run_id(1),
+            completion_outcome,
+        }
+    }
+
+    fn run_failed(detail: &str) -> HarnessEvent {
+        HarnessEvent::RunFailed {
+            run_id: run_id(1),
+            detail: detail.to_owned(),
+        }
+    }
+
     fn type_input(app_state: &mut AppState, input: &str) {
         for character in input.chars() {
             app_state.handle_key(key_event(KeyCode::Char(character)));
@@ -121,16 +174,15 @@ mod tests {
     fn settled_conversation() -> AppState {
         let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state.accept_submission("hello from user".to_owned());
-        app_state.handle_harness_event(HarnessEvent::ResponseStarted);
-        app_state.handle_harness_event(HarnessEvent::AssistantDelta(
-            "hello from assistant".to_owned(),
-        ));
-        app_state.handle_harness_event(HarnessEvent::Usage(Usage {
+        app_state.handle_harness_event(run_started("hello from user"));
+        app_state.handle_harness_event(assistant_started());
+        app_state.handle_harness_event(assistant_delta("hello from assistant"));
+        app_state.handle_harness_event(addressed_usage(Usage {
             input_tokens: 24,
             cached_input_tokens: 8,
             output_tokens: 16,
         }));
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
+        app_state.handle_harness_event(run_finished(CompletionOutcome::Complete));
         app_state
     }
 
@@ -190,6 +242,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 4)).unwrap();
         let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state.accept_submission("request".to_owned());
+        app_state.handle_harness_event(run_started("request"));
 
         draw(&mut terminal, &mut app_state);
         assert!(buffer_line(&terminal, 2).contains("model: mock-runtime | responding"));
@@ -197,12 +250,12 @@ mod tests {
         assert!(!buffer_text(&terminal).contains("cache"));
         assert!(!buffer_text(&terminal).contains("out"));
 
-        app_state.handle_harness_event(HarnessEvent::Usage(Usage {
+        app_state.handle_harness_event(addressed_usage(Usage {
             input_tokens: 12,
             cached_input_tokens: 4,
             output_tokens: 8,
         }));
-        app_state.handle_harness_event(HarnessEvent::Error("runtime failed".to_owned()));
+        app_state.handle_harness_event(run_failed("runtime failed"));
         draw(&mut terminal, &mut app_state);
         assert!(
             buffer_line(&terminal, 2)
@@ -215,16 +268,15 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
         let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state.accept_submission("request".to_owned());
-        app_state.handle_harness_event(HarnessEvent::ResponseStarted);
-        app_state.handle_harness_event(HarnessEvent::AssistantDelta("partial".to_owned()));
-        app_state.handle_harness_event(HarnessEvent::Usage(Usage {
+        app_state.handle_harness_event(run_started("request"));
+        app_state.handle_harness_event(assistant_started());
+        app_state.handle_harness_event(assistant_delta("partial"));
+        app_state.handle_harness_event(addressed_usage(Usage {
             input_tokens: 42,
             cached_input_tokens: 17,
             output_tokens: 99,
         }));
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished(
-            CompletionOutcome::LengthLimited,
-        ));
+        app_state.handle_harness_event(run_finished(CompletionOutcome::LengthLimited));
 
         draw(&mut terminal, &mut app_state);
 
@@ -246,14 +298,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
         let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state.accept_submission("request".to_owned());
-        app_state.handle_harness_event(HarnessEvent::Usage(Usage {
+        app_state.handle_harness_event(run_started("request"));
+        app_state.handle_harness_event(addressed_usage(Usage {
             input_tokens: 100,
             cached_input_tokens: 50,
             output_tokens: 200,
         }));
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished(
-            CompletionOutcome::LengthLimited,
-        ));
+        app_state.handle_harness_event(run_finished(CompletionOutcome::LengthLimited));
 
         draw(&mut terminal, &mut app_state);
 
@@ -284,10 +335,11 @@ mod tests {
         let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state
             .accept_submission("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz".to_owned());
-        app_state.handle_harness_event(HarnessEvent::ResponseStarted);
-        app_state.handle_harness_event(HarnessEvent::AssistantDelta(
-            "0123456789012345678901234567890123456789".to_owned(),
+        app_state.handle_harness_event(run_started(
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
         ));
+        app_state.handle_harness_event(assistant_started());
+        app_state.handle_harness_event(assistant_delta("0123456789012345678901234567890123456789"));
 
         draw(&mut terminal, &mut app_state);
 
@@ -314,8 +366,8 @@ mod tests {
         draw(&mut terminal, &mut app_state);
         assert_eq!(app_state.top_wrapped_line_offset(), manual_offset);
 
-        app_state.handle_harness_event(HarnessEvent::AssistantDelta(
-            " additional streamed content that grows the response".to_owned(),
+        app_state.handle_harness_event(assistant_delta(
+            " additional streamed content that grows the response",
         ));
         draw(&mut terminal, &mut app_state);
         assert_eq!(app_state.top_wrapped_line_offset(), manual_offset);

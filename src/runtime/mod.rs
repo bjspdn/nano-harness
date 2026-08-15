@@ -6,8 +6,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::provider::{
-    CompletionOutcome, ModelEvent, ModelMetadata, ModelRequest, Provider, ProviderError, Usage,
+    CompletionOutcome, ModelEvent, ModelMetadata, Provider, ProviderError, Usage,
 };
+use crate::session::{FailureCategory, MessageId, RunId, Session};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 4;
 const EVENT_CHANNEL_CAPACITY: usize = 8;
@@ -28,11 +29,35 @@ pub enum HarnessEvent {
     CatalogFailed(String),
     ModelSelected(ModelMetadata),
     ModelSelectionFailed(String),
-    ResponseStarted,
-    AssistantDelta(String),
-    Usage(Usage),
-    ResponseFinished(CompletionOutcome),
-    Error(String),
+    RunStarted {
+        run_id: RunId,
+        user_message_id: MessageId,
+        content: String,
+    },
+    AssistantStarted {
+        run_id: RunId,
+        assistant_message_id: MessageId,
+    },
+    AssistantDelta {
+        run_id: RunId,
+        assistant_message_id: MessageId,
+        text: String,
+    },
+    Usage {
+        run_id: RunId,
+        usage: Usage,
+    },
+    RunFinished {
+        run_id: RunId,
+        completion_outcome: CompletionOutcome,
+    },
+    RunFailed {
+        run_id: RunId,
+        detail: String,
+    },
+    SubmissionFailed {
+        detail: String,
+    },
 }
 
 #[derive(Debug)]
@@ -75,7 +100,7 @@ pub fn spawn_runtime(
 
         let mut catalog_state = CatalogState::Loading;
         let mut catalog_task = Some(spawn_catalog_task(Arc::clone(&provider)));
-        let mut selected_model_id = model_id;
+        let mut session = Session::new(model_id);
 
         loop {
             let loop_outcome = tokio::select! {
@@ -84,7 +109,7 @@ pub fn spawn_runtime(
                         Some(command) => handle_runtime_command(
                             command,
                             &provider,
-                            &mut selected_model_id,
+                            &mut session,
                             &mut catalog_state,
                             &mut catalog_task,
                             &event_sender,
@@ -98,7 +123,7 @@ pub fn spawn_runtime(
                         .expect("catalog task should exist while its result is selected");
                     handle_catalog_result(
                         catalog_result,
-                        &mut selected_model_id,
+                        &session,
                         &mut catalog_state,
                         &mut catalog_task,
                         &event_sender,
@@ -135,7 +160,7 @@ async fn await_catalog_task(
 async fn handle_runtime_command(
     command: RuntimeCommand,
     provider: &Arc<dyn Provider>,
-    selected_model_id: &mut String,
+    session: &mut Session,
     catalog_state: &mut CatalogState,
     catalog_task: &mut Option<CatalogTask>,
     event_sender: &mpsc::Sender<HarnessEvent>,
@@ -145,10 +170,10 @@ async fn handle_runtime_command(
             discover_models(provider, catalog_state, catalog_task, event_sender).await
         }
         RuntimeCommand::SelectModel(model_id) => {
-            select_model(model_id, selected_model_id, catalog_state, event_sender).await
+            select_model(model_id, session, catalog_state, event_sender).await
         }
         RuntimeCommand::Submit(input) => {
-            consume_provider_stream(provider.as_ref(), selected_model_id, input, event_sender).await
+            consume_provider_stream(provider.as_ref(), session, input, event_sender).await
         }
     }
 }
@@ -174,7 +199,7 @@ async fn discover_models(
 
 async fn select_model(
     model_id: String,
-    selected_model_id: &mut String,
+    session: &mut Session,
     catalog_state: &CatalogState,
     event_sender: &mpsc::Sender<HarnessEvent>,
 ) -> StreamOutcome {
@@ -206,7 +231,7 @@ async fn select_model(
         }
     };
 
-    *selected_model_id = metadata.model_id.clone();
+    session.select_model(metadata.model_id.clone());
     if send_harness_event(event_sender, HarnessEvent::ModelSelected(metadata)).await {
         StreamOutcome::Continue
     } else {
@@ -216,7 +241,7 @@ async fn select_model(
 
 async fn handle_catalog_result(
     catalog_result: Result<Result<Vec<ModelMetadata>, ProviderError>, tokio::task::JoinError>,
-    selected_model_id: &mut String,
+    session: &Session,
     catalog_state: &mut CatalogState,
     catalog_task: &mut Option<CatalogTask>,
     event_sender: &mpsc::Sender<HarnessEvent>,
@@ -245,7 +270,7 @@ async fn handle_catalog_result(
 
     let selected_metadata = models
         .iter()
-        .find(|metadata| metadata.model_id == *selected_model_id)
+        .find(|metadata| metadata.model_id == session.current_model_id())
         .cloned();
     *catalog_state = CatalogState::Loaded(models.clone());
 
@@ -295,14 +320,29 @@ enum StreamOutcome {
 
 async fn consume_provider_stream(
     provider: &dyn Provider,
-    model_id: &str,
+    session: &mut Session,
     input: String,
     event_sender: &mpsc::Sender<HarnessEvent>,
 ) -> StreamOutcome {
-    let request = ModelRequest {
-        model_id: model_id.to_owned(),
-        input,
+    let submitted_content = input.clone();
+    let run_start = match session.start_run(input) {
+        Ok(run_start) => run_start,
+        Err(error) => return report_submission_failure(event_sender, error.to_string()).await,
     };
+    let run_id = run_start.run_id();
+    if !send_harness_event(
+        event_sender,
+        HarnessEvent::RunStarted {
+            run_id,
+            user_message_id: run_start.user_message_id(),
+            content: submitted_content,
+        },
+    )
+    .await
+    {
+        return StreamOutcome::Exit;
+    }
+    let request = run_start.request().clone();
 
     let stream_result = tokio::select! {
         stream_result = provider.stream(request) => stream_result,
@@ -311,11 +351,17 @@ async fn consume_provider_stream(
     let mut model_stream = match stream_result {
         Ok(model_stream) => model_stream,
         Err(error) => {
-            return report_error(event_sender, error.to_string()).await;
+            return report_run_failure(
+                session,
+                run_id,
+                FailureCategory::RequestSetup,
+                error.to_string(),
+                event_sender,
+            )
+            .await;
         }
     };
 
-    let mut response_started = false;
     loop {
         let model_event = tokio::select! {
             model_event = model_stream.recv() => model_event,
@@ -323,9 +369,12 @@ async fn consume_provider_stream(
         };
 
         let Some(model_event) = model_event else {
-            return report_error(
-                event_sender,
+            return report_run_failure(
+                session,
+                run_id,
+                FailureCategory::IncompleteStream,
                 "provider stream ended before a terminal event".to_owned(),
+                event_sender,
             )
             .await;
         };
@@ -336,22 +385,51 @@ async fn consume_provider_stream(
                     continue;
                 }
 
-                if !response_started {
-                    if !send_harness_event(event_sender, HarnessEvent::ResponseStarted).await {
-                        return StreamOutcome::Exit;
-                    }
-                    response_started = true;
+                let assistant_delta =
+                    match session.append_assistant_delta(run_id, text_delta.clone()) {
+                        Ok(assistant_delta) => assistant_delta,
+                        Err(_) => return StreamOutcome::Exit,
+                    };
+                let Some(assistant_message_id) = assistant_delta.assistant_message_id() else {
+                    return StreamOutcome::Exit;
+                };
+
+                if assistant_delta.assistant_message_created()
+                    && !send_harness_event(
+                        event_sender,
+                        HarnessEvent::AssistantStarted {
+                            run_id,
+                            assistant_message_id,
+                        },
+                    )
+                    .await
+                {
+                    return StreamOutcome::Exit;
                 }
 
-                if !send_harness_event(event_sender, HarnessEvent::AssistantDelta(text_delta)).await
+                if !send_harness_event(
+                    event_sender,
+                    HarnessEvent::AssistantDelta {
+                        run_id,
+                        assistant_message_id,
+                        text: text_delta,
+                    },
+                )
+                .await
                 {
                     return StreamOutcome::Exit;
                 }
             }
             Ok(ModelEvent::Finished(completion_outcome)) => {
+                if session.finish_run(run_id, completion_outcome).is_err() {
+                    return StreamOutcome::Exit;
+                }
                 if !send_harness_event(
                     event_sender,
-                    HarnessEvent::ResponseFinished(completion_outcome),
+                    HarnessEvent::RunFinished {
+                        run_id,
+                        completion_outcome,
+                    },
                 )
                 .await
                 {
@@ -360,18 +438,51 @@ async fn consume_provider_stream(
                 return StreamOutcome::Continue;
             }
             Ok(ModelEvent::Usage(usage)) => {
-                if !send_harness_event(event_sender, HarnessEvent::Usage(usage)).await {
+                if session.record_usage(run_id, usage).is_err() {
+                    return StreamOutcome::Exit;
+                }
+                if !send_harness_event(event_sender, HarnessEvent::Usage { run_id, usage }).await {
                     return StreamOutcome::Exit;
                 }
             }
             Ok(ModelEvent::ReasoningDelta(_)) | Ok(ModelEvent::ToolCall(_)) => {}
-            Err(error) => return report_error(event_sender, error.to_string()).await,
+            Err(error) => {
+                return report_run_failure(
+                    session,
+                    run_id,
+                    FailureCategory::Streaming,
+                    error.to_string(),
+                    event_sender,
+                )
+                .await;
+            }
         }
     }
 }
 
-async fn report_error(event_sender: &mpsc::Sender<HarnessEvent>, error: String) -> StreamOutcome {
-    if send_harness_event(event_sender, HarnessEvent::Error(error)).await {
+async fn report_run_failure(
+    session: &mut Session,
+    run_id: RunId,
+    category: FailureCategory,
+    detail: String,
+    event_sender: &mpsc::Sender<HarnessEvent>,
+) -> StreamOutcome {
+    if session.fail_run(run_id, category, detail.clone()).is_err() {
+        return StreamOutcome::Exit;
+    }
+
+    if send_harness_event(event_sender, HarnessEvent::RunFailed { run_id, detail }).await {
+        StreamOutcome::Continue
+    } else {
+        StreamOutcome::Exit
+    }
+}
+
+async fn report_submission_failure(
+    event_sender: &mpsc::Sender<HarnessEvent>,
+    detail: String,
+) -> StreamOutcome {
+    if send_harness_event(event_sender, HarnessEvent::SubmissionFailed { detail }).await {
         StreamOutcome::Continue
     } else {
         StreamOutcome::Exit
@@ -396,9 +507,10 @@ mod tests {
 
     use super::{HarnessEvent, RuntimeCommand};
     use crate::provider::{
-        CompletionOutcome, ModelEvent, ModelLimits, ModelMetadata, ModelRequest, ModelStream,
-        Provider, ProviderError, ToolCall, Usage,
+        CompletionOutcome, ModelEvent, ModelLimits, ModelMessage, ModelMetadata, ModelRequest,
+        ModelStream, Provider, ProviderError, ToolCall, Usage,
     };
+    use crate::session::{MessageId, RunId, Session};
 
     const TEST_MODEL_ID: &str = "test-model";
 
@@ -434,6 +546,91 @@ mod tests {
         );
     }
 
+    async fn expect_run_started(
+        event_receiver: &mut mpsc::Receiver<HarnessEvent>,
+        expected_content: &str,
+    ) -> (RunId, MessageId) {
+        let Some(HarnessEvent::RunStarted {
+            run_id,
+            user_message_id,
+            content,
+        }) = event_receiver.recv().await
+        else {
+            panic!("expected a run-started event");
+        };
+        assert_eq!(content, expected_content);
+        (run_id, user_message_id)
+    }
+
+    async fn expect_assistant_started(
+        event_receiver: &mut mpsc::Receiver<HarnessEvent>,
+        run_id: RunId,
+        assistant_message_id: MessageId,
+    ) {
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::AssistantStarted {
+                run_id,
+                assistant_message_id,
+            })
+        );
+    }
+
+    async fn expect_assistant_delta(
+        event_receiver: &mut mpsc::Receiver<HarnessEvent>,
+        run_id: RunId,
+        assistant_message_id: MessageId,
+        text: &str,
+    ) {
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::AssistantDelta {
+                run_id,
+                assistant_message_id,
+                text: text.to_owned(),
+            })
+        );
+    }
+
+    async fn expect_usage(
+        event_receiver: &mut mpsc::Receiver<HarnessEvent>,
+        run_id: RunId,
+        usage: Usage,
+    ) {
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::Usage { run_id, usage })
+        );
+    }
+
+    async fn expect_run_finished(
+        event_receiver: &mut mpsc::Receiver<HarnessEvent>,
+        run_id: RunId,
+        completion_outcome: CompletionOutcome,
+    ) {
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::RunFinished {
+                run_id,
+                completion_outcome,
+            })
+        );
+    }
+
+    async fn expect_run_failed(
+        event_receiver: &mut mpsc::Receiver<HarnessEvent>,
+        run_id: RunId,
+        detail: &str,
+    ) {
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::RunFailed {
+                run_id,
+                detail: detail.to_owned(),
+            })
+        );
+    }
+
     async fn wait_for_catalog_request(provider: &ScriptedProvider) {
         for _ in 0..64 {
             if provider.catalog_request_count() > 0 {
@@ -442,6 +639,36 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("the catalog request should have started");
+    }
+
+    #[tokio::test]
+    async fn rejected_session_start_emits_submission_failure_without_a_run_projection() {
+        let provider = ScriptedProvider::new(Vec::new());
+        let mut session = Session::new(TEST_MODEL_ID.to_owned());
+        session
+            .start_run("active request".to_owned())
+            .expect("the first run should start");
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
+
+        assert_eq!(
+            super::consume_provider_stream(
+                &provider,
+                &mut session,
+                "rejected request".to_owned(),
+                &event_sender,
+            )
+            .await,
+            super::StreamOutcome::Continue
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::SubmissionFailed {
+                detail: "run RunId(1) is still active".to_owned(),
+            })
+        );
+        assert!(event_receiver.try_recv().is_err());
+        assert!(provider.requests().is_empty());
+        assert_eq!(session.runs().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -476,10 +703,11 @@ mod tests {
             .await
             .expect("runtime should accept the fake submission");
 
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
+        let (run_id, user_message_id) = expect_run_started(&mut event_receiver, "fake input").await;
+        assert_eq!(run_id.as_u64(), 1);
+        assert_eq!(user_message_id.as_u64(), 1);
+        let assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(&mut event_receiver, run_id, assistant_message_id).await;
 
         let expected_chunks = [
             "The mock runtime received your message. ",
@@ -492,10 +720,13 @@ mod tests {
                 tokio::time::advance(std::time::Duration::from_millis(25)).await;
             }
 
-            assert_eq!(
-                event_receiver.recv().await,
-                Some(HarnessEvent::AssistantDelta((*expected_chunk).to_owned()))
-            );
+            expect_assistant_delta(
+                &mut event_receiver,
+                run_id,
+                assistant_message_id,
+                expected_chunk,
+            )
+            .await;
             response.push_str(expected_chunk);
         }
 
@@ -503,18 +734,17 @@ mod tests {
             response,
             "The mock runtime received your message. This response is deterministic and streamed in chunks. The mock work is complete."
         );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::Usage(Usage {
+        expect_usage(
+            &mut event_receiver,
+            run_id,
+            Usage {
                 input_tokens: 24,
                 cached_input_tokens: 8,
                 output_tokens: 16,
-            }))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+            },
+        )
+        .await;
+        expect_run_finished(&mut event_receiver, run_id, CompletionOutcome::Complete).await;
 
         drop(command_sender);
         assert!(task_handle.await.is_ok());
@@ -523,7 +753,10 @@ mod tests {
     #[tokio::test]
     async fn forwards_exact_requests_and_keeps_turns_serial() {
         let provider = Arc::new(ScriptedProvider::new(vec![
-            StreamScript::Events(vec![Ok(ModelEvent::Finished(CompletionOutcome::Complete))]),
+            StreamScript::Events(vec![
+                Ok(ModelEvent::TextDelta("first response".to_owned())),
+                Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
+            ]),
             StreamScript::Events(vec![Ok(ModelEvent::Finished(CompletionOutcome::Complete))]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
@@ -534,15 +767,37 @@ mod tests {
             .send(RuntimeCommand::Submit(" first\nsubmission ".to_owned()))
             .await
             .expect("runtime should accept the first submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+        let (first_run_id, first_user_message_id) =
+            expect_run_started(&mut event_receiver, " first\nsubmission ").await;
+        assert_eq!(first_run_id.as_u64(), 1);
+        assert_eq!(first_user_message_id.as_u64(), 1);
+        let first_assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+            "first response",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            first_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
         assert_eq!(
             provider.requests(),
             vec![ModelRequest {
                 model_id: TEST_MODEL_ID.to_owned(),
-                input: " first\nsubmission ".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: " first\nsubmission ".to_owned(),
+                }],
             }]
         );
 
@@ -550,20 +805,138 @@ mod tests {
             .send(RuntimeCommand::Submit("second submission".to_owned()))
             .await
             .expect("runtime should accept the second submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+        let (second_run_id, second_user_message_id) =
+            expect_run_started(&mut event_receiver, "second submission").await;
+        assert_eq!(second_run_id.as_u64(), 2);
+        assert_eq!(second_user_message_id.as_u64(), 3);
+        expect_run_finished(
+            &mut event_receiver,
+            second_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
         assert_eq!(
             provider.requests(),
             vec![
                 ModelRequest {
                     model_id: TEST_MODEL_ID.to_owned(),
-                    input: " first\nsubmission ".to_owned(),
+                    messages: vec![ModelMessage::User {
+                        content: " first\nsubmission ".to_owned(),
+                    }],
                 },
                 ModelRequest {
                     model_id: TEST_MODEL_ID.to_owned(),
-                    input: "second submission".to_owned(),
+                    messages: vec![
+                        ModelMessage::User {
+                            content: " first\nsubmission ".to_owned(),
+                        },
+                        ModelMessage::Assistant {
+                            content: "first response".to_owned(),
+                            tool_calls: Vec::new(),
+                        },
+                        ModelMessage::User {
+                            content: "second submission".to_owned(),
+                        },
+                    ],
+                },
+            ]
+        );
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn scripted_response_can_depend_on_first_turn_history() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            StreamScript::ResponseFromFirstUser,
+            StreamScript::ResponseFromFirstUser,
+        ]));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
+
+        command_sender
+            .send(RuntimeCommand::Submit("first anchor".to_owned()))
+            .await
+            .expect("runtime should accept the first submission");
+        let (first_run_id, first_user_message_id) =
+            expect_run_started(&mut event_receiver, "first anchor").await;
+        assert_eq!(first_run_id.as_u64(), 1);
+        assert_eq!(first_user_message_id.as_u64(), 1);
+        let first_assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+            "remembered: first anchor",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            first_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        command_sender
+            .send(RuntimeCommand::Submit("second turn".to_owned()))
+            .await
+            .expect("runtime should accept the second submission");
+        let (second_run_id, second_user_message_id) =
+            expect_run_started(&mut event_receiver, "second turn").await;
+        assert_eq!(second_run_id.as_u64(), 2);
+        assert_eq!(second_user_message_id.as_u64(), 3);
+        let second_assistant_message_id = MessageId::from_u64(4);
+        expect_assistant_started(
+            &mut event_receiver,
+            second_run_id,
+            second_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            second_run_id,
+            second_assistant_message_id,
+            "remembered: first anchor",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            second_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        assert_eq!(
+            provider.requests(),
+            vec![
+                ModelRequest {
+                    model_id: TEST_MODEL_ID.to_owned(),
+                    messages: vec![ModelMessage::User {
+                        content: "first anchor".to_owned(),
+                    }],
+                },
+                ModelRequest {
+                    model_id: TEST_MODEL_ID.to_owned(),
+                    messages: vec![
+                        ModelMessage::User {
+                            content: "first anchor".to_owned(),
+                        },
+                        ModelMessage::Assistant {
+                            content: "remembered: first anchor".to_owned(),
+                            tool_calls: Vec::new(),
+                        },
+                        ModelMessage::User {
+                            content: "second turn".to_owned(),
+                        },
+                    ],
                 },
             ]
         );
@@ -726,16 +1099,236 @@ mod tests {
             .send(RuntimeCommand::Submit("selected model input".to_owned()))
             .await
             .expect("runtime should accept a submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+        let (run_id, user_message_id) =
+            expect_run_started(&mut event_receiver, "selected model input").await;
+        assert_eq!(run_id.as_u64(), 1);
+        assert_eq!(user_message_id.as_u64(), 1);
+        expect_run_finished(&mut event_receiver, run_id, CompletionOutcome::Complete).await;
         assert_eq!(
             provider.requests(),
             vec![ModelRequest {
                 model_id: alternate_model.model_id,
-                input: "selected model input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "selected model input".to_owned(),
+                }],
             }]
+        );
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn accepted_model_switch_preserves_history_and_changes_next_run() {
+        let alternate_model = test_model_metadata("alternate-model");
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::Result(Ok(vec![
+                test_model_metadata(TEST_MODEL_ID),
+                alternate_model.clone(),
+            ]))],
+            vec![
+                StreamScript::Events(vec![
+                    Ok(ModelEvent::TextDelta("first answer".to_owned())),
+                    Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
+                ]),
+                StreamScript::Events(vec![Ok(ModelEvent::Finished(CompletionOutcome::Complete))]),
+            ],
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(vec![
+                test_model_metadata(TEST_MODEL_ID),
+                alternate_model.clone(),
+            ]))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(test_model_metadata(
+                TEST_MODEL_ID
+            )))
+        );
+
+        command_sender
+            .send(RuntimeCommand::Submit("first request".to_owned()))
+            .await
+            .expect("runtime should accept the first submission");
+        let (first_run_id, _) = expect_run_started(&mut event_receiver, "first request").await;
+        let first_assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+            "first answer",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            first_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        command_sender
+            .send(RuntimeCommand::SelectModel(
+                alternate_model.model_id.clone(),
+            ))
+            .await
+            .expect("runtime should accept the alternate model selection");
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(alternate_model.clone()))
+        );
+
+        command_sender
+            .send(RuntimeCommand::Submit("second request".to_owned()))
+            .await
+            .expect("runtime should accept the second submission");
+        let (second_run_id, second_user_message_id) =
+            expect_run_started(&mut event_receiver, "second request").await;
+        assert_eq!(second_run_id.as_u64(), 2);
+        assert_eq!(second_user_message_id.as_u64(), 3);
+        expect_run_finished(
+            &mut event_receiver,
+            second_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        assert_eq!(
+            provider.requests()[1],
+            ModelRequest {
+                model_id: alternate_model.model_id,
+                messages: vec![
+                    ModelMessage::User {
+                        content: "first request".to_owned(),
+                    },
+                    ModelMessage::Assistant {
+                        content: "first answer".to_owned(),
+                        tool_calls: Vec::new(),
+                    },
+                    ModelMessage::User {
+                        content: "second request".to_owned(),
+                    },
+                ],
+            }
+        );
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_model_switch_preserves_history_and_current_request_model() {
+        let alternate_model = test_model_metadata("alternate-model");
+        let provider = Arc::new(ScriptedProvider::with_catalog_scripts(
+            vec![CatalogScript::Result(Ok(vec![
+                test_model_metadata(TEST_MODEL_ID),
+                alternate_model.clone(),
+            ]))],
+            vec![
+                StreamScript::Events(vec![
+                    Ok(ModelEvent::TextDelta("first answer".to_owned())),
+                    Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
+                ]),
+                StreamScript::Events(vec![Ok(ModelEvent::Finished(CompletionOutcome::Complete))]),
+            ],
+        ));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoading)
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::CatalogLoaded(vec![
+                test_model_metadata(TEST_MODEL_ID),
+                alternate_model,
+            ]))
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelected(test_model_metadata(
+                TEST_MODEL_ID
+            )))
+        );
+
+        command_sender
+            .send(RuntimeCommand::Submit("first request".to_owned()))
+            .await
+            .expect("runtime should accept the first submission");
+        let (first_run_id, _) = expect_run_started(&mut event_receiver, "first request").await;
+        let first_assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+            "first answer",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            first_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        command_sender
+            .send(RuntimeCommand::SelectModel("missing-model".to_owned()))
+            .await
+            .expect("runtime should accept the rejected selection command");
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(HarnessEvent::ModelSelectionFailed(detail))
+                if detail == "model 'missing-model' is not available in the loaded catalog"
+        ));
+
+        command_sender
+            .send(RuntimeCommand::Submit("second request".to_owned()))
+            .await
+            .expect("runtime should accept the second submission");
+        let (second_run_id, _) = expect_run_started(&mut event_receiver, "second request").await;
+        expect_run_finished(
+            &mut event_receiver,
+            second_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        assert_eq!(provider.requests()[1].model_id, TEST_MODEL_ID);
+        assert_eq!(
+            provider.requests()[1].messages,
+            vec![
+                ModelMessage::User {
+                    content: "first request".to_owned(),
+                },
+                ModelMessage::Assistant {
+                    content: "first answer".to_owned(),
+                    tool_calls: Vec::new(),
+                },
+                ModelMessage::User {
+                    content: "second request".to_owned(),
+                },
+            ]
         );
 
         drop(command_sender);
@@ -789,10 +1382,8 @@ mod tests {
             .send(RuntimeCommand::Submit("preserve active model".to_owned()))
             .await
             .expect("runtime should accept a submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+        let (run_id, _) = expect_run_started(&mut event_receiver, "preserve active model").await;
+        expect_run_finished(&mut event_receiver, run_id, CompletionOutcome::Complete).await;
         assert_eq!(provider.requests()[0].model_id, TEST_MODEL_ID);
 
         drop(command_sender);
@@ -838,10 +1429,8 @@ mod tests {
             .send(RuntimeCommand::Submit("loading catalog input".to_owned()))
             .await
             .expect("runtime should accept a submission while discovery is pending");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+        let (run_id, _) = expect_run_started(&mut event_receiver, "loading catalog input").await;
+        expect_run_finished(&mut event_receiver, run_id, CompletionOutcome::Complete).await;
         assert_eq!(provider.requests()[0].model_id, TEST_MODEL_ID);
 
         drop(event_receiver);
@@ -865,24 +1454,152 @@ mod tests {
             Ok(ModelEvent::Finished(CompletionOutcome::LengthLimited)),
         ])]));
         let (command_sender, mut event_receiver, task_handle) =
-            super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
         settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("limited input".to_owned()))
             .await
             .expect("runtime should accept a submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::Usage(usage))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(
-                CompletionOutcome::LengthLimited
-            ))
-        );
+        let (run_id, _) = expect_run_started(&mut event_receiver, "limited input").await;
+        expect_usage(&mut event_receiver, run_id, usage).await;
+        expect_run_finished(
+            &mut event_receiver,
+            run_id,
+            CompletionOutcome::LengthLimited,
+        )
+        .await;
         assert!(event_receiver.try_recv().is_err());
+
+        drop(command_sender);
+        assert!(task_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn complete_limited_and_no_content_runs_build_history_from_retained_output() {
+        let limited_usage = Usage {
+            input_tokens: 20,
+            cached_input_tokens: 8,
+            output_tokens: 7,
+        };
+        let no_content_usage = Usage {
+            input_tokens: 30,
+            cached_input_tokens: 12,
+            output_tokens: 0,
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            StreamScript::Events(vec![
+                Ok(ModelEvent::TextDelta("complete answer".to_owned())),
+                Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
+            ]),
+            StreamScript::Events(vec![
+                Ok(ModelEvent::TextDelta("limited answer".to_owned())),
+                Ok(ModelEvent::Usage(limited_usage)),
+                Ok(ModelEvent::Finished(CompletionOutcome::LengthLimited)),
+            ]),
+            StreamScript::Events(vec![
+                Ok(ModelEvent::Usage(no_content_usage)),
+                Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
+            ]),
+        ]));
+        let (command_sender, mut event_receiver, task_handle) =
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
+        settle_default_catalog(&mut event_receiver).await;
+
+        command_sender
+            .send(RuntimeCommand::Submit("first".to_owned()))
+            .await
+            .expect("runtime should accept the first submission");
+        let (first_run_id, _) = expect_run_started(&mut event_receiver, "first").await;
+        let first_assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+            "complete answer",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            first_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        command_sender
+            .send(RuntimeCommand::Submit("second".to_owned()))
+            .await
+            .expect("runtime should accept the second submission");
+        let (second_run_id, _) = expect_run_started(&mut event_receiver, "second").await;
+        let second_assistant_message_id = MessageId::from_u64(4);
+        expect_assistant_started(
+            &mut event_receiver,
+            second_run_id,
+            second_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            second_run_id,
+            second_assistant_message_id,
+            "limited answer",
+        )
+        .await;
+        expect_usage(&mut event_receiver, second_run_id, limited_usage).await;
+        expect_run_finished(
+            &mut event_receiver,
+            second_run_id,
+            CompletionOutcome::LengthLimited,
+        )
+        .await;
+
+        command_sender
+            .send(RuntimeCommand::Submit("third".to_owned()))
+            .await
+            .expect("runtime should accept the third submission");
+        let (third_run_id, third_user_message_id) =
+            expect_run_started(&mut event_receiver, "third").await;
+        assert_eq!(third_run_id.as_u64(), 3);
+        assert_eq!(third_user_message_id.as_u64(), 5);
+        expect_usage(&mut event_receiver, third_run_id, no_content_usage).await;
+        expect_run_finished(
+            &mut event_receiver,
+            third_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
+        assert_eq!(
+            provider.requests()[2],
+            ModelRequest {
+                model_id: TEST_MODEL_ID.to_owned(),
+                messages: vec![
+                    ModelMessage::User {
+                        content: "first".to_owned(),
+                    },
+                    ModelMessage::Assistant {
+                        content: "complete answer".to_owned(),
+                        tool_calls: Vec::new(),
+                    },
+                    ModelMessage::User {
+                        content: "second".to_owned(),
+                    },
+                    ModelMessage::Assistant {
+                        content: "limited answer".to_owned(),
+                        tool_calls: Vec::new(),
+                    },
+                    ModelMessage::User {
+                        content: "third".to_owned(),
+                    },
+                ],
+            }
+        );
 
         drop(command_sender);
         assert!(task_handle.await.is_ok());
@@ -916,26 +1633,21 @@ mod tests {
             .await
             .expect("runtime should accept the submission");
 
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::Usage(Usage {
+        let (run_id, _) = expect_run_started(&mut event_receiver, "input").await;
+        expect_usage(
+            &mut event_receiver,
+            run_id,
+            Usage {
                 input_tokens: 4,
                 cached_input_tokens: 2,
                 output_tokens: 3,
-            }))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::AssistantDelta("visible".to_owned()))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+            },
+        )
+        .await;
+        let assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(&mut event_receiver, run_id, assistant_message_id).await;
+        expect_assistant_delta(&mut event_receiver, run_id, assistant_message_id, "visible").await;
+        expect_run_finished(&mut event_receiver, run_id, CompletionOutcome::Complete).await;
         assert!(event_receiver.try_recv().is_err());
 
         drop(command_sender);
@@ -968,18 +1680,18 @@ mod tests {
             .await
             .expect("runtime should accept the submission");
 
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::Usage(Usage {
+        let (run_id, _) = expect_run_started(&mut event_receiver, "input").await;
+        expect_usage(
+            &mut event_receiver,
+            run_id,
+            Usage {
                 input_tokens: 4,
                 cached_input_tokens: 2,
                 output_tokens: 3,
-            }))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+            },
+        )
+        .await;
+        expect_run_finished(&mut event_receiver, run_id, CompletionOutcome::Complete).await;
         assert!(event_receiver.try_recv().is_err());
 
         drop(command_sender);
@@ -996,36 +1708,75 @@ mod tests {
             ]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
-            super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
         settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("first".to_owned()))
             .await
             .expect("runtime should accept the first submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::Error(
-                "request setup failed: invalid request".to_owned()
-            ))
-        );
+        let (first_run_id, first_user_message_id) =
+            expect_run_started(&mut event_receiver, "first").await;
+        assert_eq!(first_run_id.as_u64(), 1);
+        assert_eq!(first_user_message_id.as_u64(), 1);
+        expect_run_failed(
+            &mut event_receiver,
+            first_run_id,
+            "request setup failed: invalid request",
+        )
+        .await;
         assert!(event_receiver.try_recv().is_err());
 
         command_sender
             .send(RuntimeCommand::Submit("recovery".to_owned()))
             .await
             .expect("runtime should accept the recovery submission");
+        let (recovery_run_id, recovery_user_message_id) =
+            expect_run_started(&mut event_receiver, "recovery").await;
+        assert_eq!(recovery_run_id.as_u64(), 2);
+        assert_eq!(recovery_user_message_id.as_u64(), 2);
+        let recovery_assistant_message_id = MessageId::from_u64(3);
+        expect_assistant_started(
+            &mut event_receiver,
+            recovery_run_id,
+            recovery_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            recovery_run_id,
+            recovery_assistant_message_id,
+            "recovered",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            recovery_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
         assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::AssistantDelta("recovered".to_owned()))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
+            provider.requests(),
+            vec![
+                ModelRequest {
+                    model_id: TEST_MODEL_ID.to_owned(),
+                    messages: vec![ModelMessage::User {
+                        content: "first".to_owned(),
+                    }],
+                },
+                ModelRequest {
+                    model_id: TEST_MODEL_ID.to_owned(),
+                    messages: vec![
+                        ModelMessage::User {
+                            content: "first".to_owned(),
+                        },
+                        ModelMessage::User {
+                            content: "recovery".to_owned(),
+                        },
+                    ],
+                },
+            ]
         );
 
         drop(command_sender);
@@ -1050,27 +1801,37 @@ mod tests {
             ]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
-            super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
         settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("first".to_owned()))
             .await
             .expect("runtime should accept the first submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::AssistantDelta("partial".to_owned()))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::Error(
-                "streaming failed: connection lost".to_owned()
-            ))
-        );
+        let (first_run_id, first_user_message_id) =
+            expect_run_started(&mut event_receiver, "first").await;
+        assert_eq!(first_run_id.as_u64(), 1);
+        assert_eq!(first_user_message_id.as_u64(), 1);
+        let first_assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+            "partial",
+        )
+        .await;
+        expect_run_failed(
+            &mut event_receiver,
+            first_run_id,
+            "streaming failed: connection lost",
+        )
+        .await;
         assert!(event_receiver.try_recv().is_err());
         tokio::time::timeout(std::time::Duration::from_secs(1), completion_receiver)
             .await
@@ -1081,17 +1842,41 @@ mod tests {
             .send(RuntimeCommand::Submit("recovery".to_owned()))
             .await
             .expect("runtime should accept the recovery submission");
+        let (recovery_run_id, recovery_user_message_id) =
+            expect_run_started(&mut event_receiver, "recovery").await;
+        assert_eq!(recovery_run_id.as_u64(), 2);
+        assert_eq!(recovery_user_message_id.as_u64(), 3);
+        let recovery_assistant_message_id = MessageId::from_u64(4);
+        expect_assistant_started(
+            &mut event_receiver,
+            recovery_run_id,
+            recovery_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            recovery_run_id,
+            recovery_assistant_message_id,
+            "recovered",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            recovery_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
         assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::AssistantDelta("recovered".to_owned()))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
+            provider.requests()[1].messages,
+            vec![
+                ModelMessage::User {
+                    content: "first".to_owned(),
+                },
+                ModelMessage::User {
+                    content: "recovery".to_owned(),
+                },
+            ]
         );
 
         drop(command_sender);
@@ -1108,44 +1893,78 @@ mod tests {
             ]),
         ]));
         let (command_sender, mut event_receiver, task_handle) =
-            super::spawn_runtime(provider, TEST_MODEL_ID.to_owned());
+            super::spawn_runtime(provider.clone(), TEST_MODEL_ID.to_owned());
         settle_default_catalog(&mut event_receiver).await;
 
         command_sender
             .send(RuntimeCommand::Submit("first".to_owned()))
             .await
             .expect("runtime should accept the first submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::AssistantDelta("partial".to_owned()))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::Error(
-                "provider stream ended before a terminal event".to_owned()
-            ))
-        );
+        let (first_run_id, first_user_message_id) =
+            expect_run_started(&mut event_receiver, "first").await;
+        assert_eq!(first_run_id.as_u64(), 1);
+        assert_eq!(first_user_message_id.as_u64(), 1);
+        let first_assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            first_run_id,
+            first_assistant_message_id,
+            "partial",
+        )
+        .await;
+        expect_run_failed(
+            &mut event_receiver,
+            first_run_id,
+            "provider stream ended before a terminal event",
+        )
+        .await;
         assert!(event_receiver.try_recv().is_err());
 
         command_sender
             .send(RuntimeCommand::Submit("recovery".to_owned()))
             .await
             .expect("runtime should accept the recovery submission");
+        let (recovery_run_id, recovery_user_message_id) =
+            expect_run_started(&mut event_receiver, "recovery").await;
+        assert_eq!(recovery_run_id.as_u64(), 2);
+        assert_eq!(recovery_user_message_id.as_u64(), 3);
+        let recovery_assistant_message_id = MessageId::from_u64(4);
+        expect_assistant_started(
+            &mut event_receiver,
+            recovery_run_id,
+            recovery_assistant_message_id,
+        )
+        .await;
+        expect_assistant_delta(
+            &mut event_receiver,
+            recovery_run_id,
+            recovery_assistant_message_id,
+            "recovered",
+        )
+        .await;
+        expect_run_finished(
+            &mut event_receiver,
+            recovery_run_id,
+            CompletionOutcome::Complete,
+        )
+        .await;
+
         assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::AssistantDelta("recovered".to_owned()))
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
+            provider.requests()[1].messages,
+            vec![
+                ModelMessage::User {
+                    content: "first".to_owned(),
+                },
+                ModelMessage::User {
+                    content: "recovery".to_owned(),
+                },
+            ]
         );
 
         drop(command_sender);
@@ -1173,10 +1992,8 @@ mod tests {
             .send(RuntimeCommand::Submit("input".to_owned()))
             .await
             .expect("runtime should accept the submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseFinished(CompletionOutcome::Complete))
-        );
+        let (run_id, _) = expect_run_started(&mut event_receiver, "input").await;
+        expect_run_finished(&mut event_receiver, run_id, CompletionOutcome::Complete).await;
         assert!(event_receiver.try_recv().is_err());
         tokio::time::timeout(std::time::Duration::from_secs(1), completion_receiver)
             .await
@@ -1212,14 +2029,10 @@ mod tests {
             .send(RuntimeCommand::Submit("input".to_owned()))
             .await
             .expect("runtime should accept the submission");
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::ResponseStarted)
-        );
-        assert_eq!(
-            event_receiver.recv().await,
-            Some(HarnessEvent::AssistantDelta("partial".to_owned()))
-        );
+        let (run_id, _) = expect_run_started(&mut event_receiver, "input").await;
+        let assistant_message_id = MessageId::from_u64(2);
+        expect_assistant_started(&mut event_receiver, run_id, assistant_message_id).await;
+        expect_assistant_delta(&mut event_receiver, run_id, assistant_message_id, "partial").await;
 
         drop(event_receiver);
         tokio::time::timeout(Duration::from_secs(1), stream_completion_receiver)
@@ -1329,6 +2142,7 @@ mod tests {
     enum StreamScript {
         SetupError(ProviderError),
         Events(Vec<Result<ModelEvent, ProviderError>>),
+        ResponseFromFirstUser,
         WaitForReceiverDrop {
             events: Vec<Result<ModelEvent, ProviderError>>,
             completion_sender: oneshot::Sender<()>,
@@ -1366,7 +2180,7 @@ mod tests {
             self.requests
                 .lock()
                 .expect("request recording lock should not be poisoned")
-                .push(request);
+                .push(request.clone());
 
             let script = self
                 .scripts
@@ -1378,6 +2192,23 @@ mod tests {
             match script {
                 StreamScript::SetupError(error) => Err(error),
                 StreamScript::Events(events) => Ok(buffered_stream(events).await),
+                StreamScript::ResponseFromFirstUser => {
+                    let first_user_content = request
+                        .messages
+                        .iter()
+                        .find_map(|message| match message {
+                            ModelMessage::User { content } => Some(content.clone()),
+                            _ => None,
+                        })
+                        .expect("the scripted request should contain a user message");
+                    Ok(buffered_stream(vec![
+                        Ok(ModelEvent::TextDelta(format!(
+                            "remembered: {first_user_content}"
+                        ))),
+                        Ok(ModelEvent::Finished(CompletionOutcome::Complete)),
+                    ])
+                    .await)
+                }
                 StreamScript::WaitForReceiverDrop {
                     events,
                     completion_sender,

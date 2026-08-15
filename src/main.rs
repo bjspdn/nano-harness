@@ -102,9 +102,7 @@ async fn run_application_loop(
                     None => {
                         event_receiver_open = false;
                         if app_state.is_responding() {
-                            app_state.handle_harness_event(HarnessEvent::Error(
-                                "runtime event channel closed".to_owned(),
-                            ));
+                            app_state.runtime_channel_closed();
                             draw(terminal, app_state)?;
                         }
                     }
@@ -226,6 +224,7 @@ mod main_tests {
         CompletionOutcome, ModelLimits, ModelMetadata, OPENROUTER_DEFAULT_MODEL_ID,
     };
     use crate::runtime::{HarnessEvent, RuntimeCommand};
+    use crate::session::{MessageId, RunId};
     use crate::tui::AppState;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
@@ -238,6 +237,14 @@ mod main_tests {
         for character in input.chars() {
             app_state.handle_key(key_event(KeyCode::Char(character)));
         }
+    }
+
+    fn run_id(value: u64) -> RunId {
+        RunId::from_u64(value)
+    }
+
+    fn message_id(value: u64) -> MessageId {
+        MessageId::from_u64(value)
     }
 
     fn model_metadata(model_id: &str, display_name: &str) -> ModelMetadata {
@@ -256,10 +263,24 @@ mod main_tests {
     fn settled_app_state() -> AppState {
         let mut app_state = AppState::new("mock-runtime", "mock-runtime");
         app_state.accept_submission("existing request".to_owned());
-        app_state.handle_harness_event(HarnessEvent::ResponseStarted);
-        app_state
-            .handle_harness_event(HarnessEvent::AssistantDelta("existing response".to_owned()));
-        app_state.handle_harness_event(HarnessEvent::ResponseFinished(CompletionOutcome::Complete));
+        app_state.handle_harness_event(HarnessEvent::RunStarted {
+            run_id: run_id(1),
+            user_message_id: message_id(1),
+            content: "existing request".to_owned(),
+        });
+        app_state.handle_harness_event(HarnessEvent::AssistantStarted {
+            run_id: run_id(1),
+            assistant_message_id: message_id(2),
+        });
+        app_state.handle_harness_event(HarnessEvent::AssistantDelta {
+            run_id: run_id(1),
+            assistant_message_id: message_id(2),
+            text: "existing response".to_owned(),
+        });
+        app_state.handle_harness_event(HarnessEvent::RunFinished {
+            run_id: run_id(1),
+            completion_outcome: CompletionOutcome::Complete,
+        });
         app_state
     }
 
@@ -296,7 +317,7 @@ mod main_tests {
             command_receiver.try_recv(),
             Ok(RuntimeCommand::Submit("hello".to_owned()))
         );
-        assert_eq!(app_state.messages().len(), 1);
+        assert!(app_state.messages().is_empty());
         assert_eq!(app_state.input(), "");
         assert!(app_state.is_responding());
         assert!(command_receiver.try_recv().is_err());
@@ -391,7 +412,7 @@ mod main_tests {
         ));
 
         assert_eq!(app_state.input(), "second request");
-        assert_eq!(app_state.messages().len(), 1);
+        assert!(app_state.messages().is_empty());
         assert!(app_state.is_responding());
         assert!(command_receiver.try_recv().is_err());
     }

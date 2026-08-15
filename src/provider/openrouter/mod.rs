@@ -141,7 +141,7 @@ impl OpenRouterProvider {
         request: &ModelRequest,
     ) -> Result<(reqwest::Response, String, ResponseContext), ProviderError> {
         let api_key = (self.credential_resolver)().map_err(ProviderError::RequestSetup)?;
-        let request_body = wire::generation_request_body(&request.model_id, &request.input)
+        let request_body = wire::generation_request_body(&request.model_id, &request.messages)
             .map_err(ProviderError::RequestSetup)?;
         let authorization_header = openrouter_authorization_header(&api_key)?;
 
@@ -532,7 +532,8 @@ mod tests {
         format_http_error, is_model_selection_error, resolve_catalog_next_url,
     };
     use crate::provider::{
-        CompletionOutcome, ModelEvent, ModelRequest, Provider, ProviderError, Usage,
+        CompletionOutcome, ModelEvent, ModelMessage, ModelRequest, Provider, ProviderError,
+        ToolCall, Usage,
     };
 
     #[derive(Debug, Clone)]
@@ -641,7 +642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_request_has_exact_body_headers_and_no_provider_state() {
+    async fn generation_request_serializes_ordered_messages_and_no_provider_state() {
         let (base_url, request_receiver, server_handle) = spawn_fixture(vec![ResponseSpec::sse(
             r#"data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
 
@@ -655,7 +656,26 @@ data: [DONE]
         let mut stream = provider
             .stream(ModelRequest {
                 model_id: "provider/model".to_owned(),
-                input: "hello".to_owned(),
+                messages: vec![
+                    ModelMessage::User {
+                        content: "hello".to_owned(),
+                    },
+                    ModelMessage::Assistant {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            tool_call_id: "call-1".to_owned(),
+                            tool_name: "lookup".to_owned(),
+                            arguments: serde_json::json!({"query": "rust"}),
+                        }],
+                    },
+                    ModelMessage::ToolResult {
+                        tool_call_id: "call-1".to_owned(),
+                        content: "lookup result".to_owned(),
+                    },
+                    ModelMessage::User {
+                        content: "follow up".to_owned(),
+                    },
+                ],
             })
             .await
             .expect("generation should start");
@@ -672,7 +692,7 @@ data: [DONE]
         assert_eq!(request.path, "/api/v1/chat/completions");
         assert_eq!(
             request.body,
-            r#"{"model":"provider/model","messages":[{"role":"user","content":"hello"}],"stream":true}"#
+            r#"{"model":"provider/model","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"rust\"}"}}]},{"role":"tool","tool_call_id":"call-1","content":"lookup result"},{"role":"user","content":"follow up"}],"stream":true}"#
         );
         assert_eq!(
             request.headers.get("authorization"),
@@ -873,7 +893,9 @@ data: [DONE]
         let mut stream = provider
             .stream(ModelRequest {
                 model_id: "provider/model".to_owned(),
-                input: "input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "input".to_owned(),
+                }],
             })
             .await
             .expect("generation should start");
@@ -908,7 +930,9 @@ data: [DONE]
         let setup_error = provider
             .stream(ModelRequest {
                 model_id: "missing/model".to_owned(),
-                input: "input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "input".to_owned(),
+                }],
             })
             .await
             .expect_err("HTTP failure should be setup error");
@@ -930,7 +954,9 @@ data: [DONE]
         let mut stream = provider
             .stream(ModelRequest {
                 model_id: "provider/model".to_owned(),
-                input: "input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "input".to_owned(),
+                }],
             })
             .await
             .expect("generation should start");
@@ -974,7 +1000,9 @@ data: [DONE]
             let mut stream = provider
                 .stream(ModelRequest {
                     model_id: "provider/model".to_owned(),
-                    input: "input".to_owned(),
+                    messages: vec![ModelMessage::User {
+                        content: "input".to_owned(),
+                    }],
                 })
                 .await
                 .expect("generation should start");
@@ -1012,7 +1040,9 @@ data: [DONE]
         let mut stream = provider
             .stream(ModelRequest {
                 model_id: "provider/model".to_owned(),
-                input: "input".to_owned(),
+                messages: vec![ModelMessage::User {
+                    content: "input".to_owned(),
+                }],
             })
             .await
             .expect("generation should start");

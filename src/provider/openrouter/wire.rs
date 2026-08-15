@@ -1,30 +1,104 @@
 use serde::{Deserialize, Serialize};
 
-use super::super::{CompletionOutcome, ModelLimits, ModelMetadata, Usage};
+use super::super::{CompletionOutcome, ModelLimits, ModelMessage, ModelMetadata, ToolCall, Usage};
 
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: [ChatMessage<'a>; 1],
+    messages: Vec<ChatMessage<'a>>,
     stream: bool,
 }
 
 #[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'static str,
-    content: &'a str,
+#[serde(untagged)]
+enum ChatMessage<'a> {
+    User {
+        role: &'static str,
+        content: &'a str,
+    },
+    Assistant {
+        role: &'static str,
+        content: &'a str,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<ChatToolCall<'a>>,
+    },
+    ToolResult {
+        role: &'static str,
+        tool_call_id: &'a str,
+        content: &'a str,
+    },
 }
 
-pub(crate) fn generation_request_body(model_id: &str, input: &str) -> Result<Vec<u8>, String> {
+#[derive(Serialize)]
+struct ChatToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: ChatFunctionCall,
+}
+
+#[derive(Serialize)]
+struct ChatFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+pub(crate) fn generation_request_body(
+    model_id: &str,
+    messages: &[ModelMessage],
+) -> Result<Vec<u8>, String> {
+    let messages = messages
+        .iter()
+        .map(chat_message)
+        .collect::<Result<Vec<_>, _>>()?;
     serde_json::to_vec(&ChatRequest {
         model: model_id,
-        messages: [ChatMessage {
-            role: "user",
-            content: input,
-        }],
+        messages,
         stream: true,
     })
     .map_err(|_| "unable to serialize the OpenRouter generation request".to_owned())
+}
+
+fn chat_message(message: &ModelMessage) -> Result<ChatMessage<'_>, String> {
+    match message {
+        ModelMessage::User { content } => Ok(ChatMessage::User {
+            role: "user",
+            content,
+        }),
+        ModelMessage::Assistant {
+            content,
+            tool_calls,
+        } => Ok(ChatMessage::Assistant {
+            role: "assistant",
+            content,
+            tool_calls: tool_calls
+                .iter()
+                .map(chat_tool_call)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        ModelMessage::ToolResult {
+            tool_call_id,
+            content,
+        } => Ok(ChatMessage::ToolResult {
+            role: "tool",
+            tool_call_id,
+            content,
+        }),
+    }
+}
+
+fn chat_tool_call(tool_call: &ToolCall) -> Result<ChatToolCall<'_>, String> {
+    let arguments = serde_json::to_string(&tool_call.arguments)
+        .map_err(|_| "unable to serialize the OpenRouter generation request".to_owned())?;
+
+    Ok(ChatToolCall {
+        id: &tool_call.tool_call_id,
+        call_type: "function",
+        function: ChatFunctionCall {
+            name: tool_call.tool_name.clone(),
+            arguments,
+        },
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,21 +421,83 @@ mod tests {
         FinishReason, ParsedSseEvent, completion_outcome, generation_request_body, normalize_price,
         parse_catalog_page, parse_sse_data,
     };
-    use crate::provider::{CompletionOutcome, ModelLimits, Usage};
+    use crate::provider::{CompletionOutcome, ModelLimits, ModelMessage, ToolCall, Usage};
 
     #[test]
-    fn generation_body_contains_only_the_independent_user_request() {
-        let body = generation_request_body("provider/model", "hello\nworld")
+    fn generation_body_serializes_ordered_neutral_messages() {
+        let messages = vec![
+            ModelMessage::User {
+                content: "hello".to_owned(),
+            },
+            ModelMessage::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "lookup".to_owned(),
+                    arguments: serde_json::json!({"query": "rust"}),
+                }],
+            },
+            ModelMessage::ToolResult {
+                tool_call_id: "call-1".to_owned(),
+                content: "lookup result".to_owned(),
+            },
+            ModelMessage::User {
+                content: "follow up".to_owned(),
+            },
+        ];
+        let body = generation_request_body("provider/model", &messages)
             .expect("request body should serialize");
 
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).expect("body should be JSON"),
             serde_json::json!({
                 "model": "provider/model",
-                "messages": [{"role": "user", "content": "hello\nworld"}],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"query\":\"rust\"}"
+                            }
+                        }]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "lookup result"
+                    },
+                    {"role": "user", "content": "follow up"}
+                ],
                 "stream": true,
             })
         );
+    }
+
+    #[test]
+    fn generation_body_omits_empty_assistant_tool_calls() {
+        let body = generation_request_body(
+            "provider/model",
+            &[ModelMessage::Assistant {
+                content: "plain response".to_owned(),
+                tool_calls: Vec::new(),
+            }],
+        )
+        .expect("request body should serialize");
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("body should be JSON"),
+            serde_json::json!({
+                "model": "provider/model",
+                "messages": [{"role": "assistant", "content": "plain response"}],
+                "stream": true,
+            })
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("tool_calls"));
     }
 
     #[test]
